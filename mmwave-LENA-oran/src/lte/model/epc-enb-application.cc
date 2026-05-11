@@ -24,6 +24,7 @@
  */
 
 #include "epc-enb-application.h"
+#include <fstream>
 
 #include "epc-gtpu-header.h"
 #include "eps-bearer-tag.h"
