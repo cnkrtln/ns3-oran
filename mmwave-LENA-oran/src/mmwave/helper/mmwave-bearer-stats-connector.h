@@ -253,6 +253,16 @@ public:
   void SetMmWaveSinrOutputFilename (std::string outputFilename);
   void SetLteSinrOutputFilename (std::string outputFilename);
 
+  /**
+   * Force reconnection of PDCP/RLC stats traces for a UE after manual handover.
+   * This clears the "seen IMSI" state and triggers trace reconnection.
+   * 
+   * @param imsi UE's IMSI
+   * @param rnti UE's new RNTI in target cell
+   * @param cellId Target cell ID
+   */
+  void ForceReconnectStatsForUe(uint64_t imsi, uint16_t rnti, uint16_t cellId);
+
 private:
   /**
    * Creates UE Manager path and stores it in m_ueManagerPathByCellIdRnti

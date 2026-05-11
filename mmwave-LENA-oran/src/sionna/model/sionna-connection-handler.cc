@@ -140,7 +140,7 @@ updateLocationInSionna(std::string obj_id, Vector Position, Vector Velocity) {
   // Waiting for NVIDIA to fix this (Doppler calculation is temporarily disabled).
   double x_speed = Velocity.x;
   double y_speed = Velocity.y;
-  double z_speed = Velocity.z;
+  // double z_speed = Velocity.z;
   
   // Same for direction angle (heading), applying to objects causes kernel crash.
   double angle = atan2(y_speed, x_speed) * 180.0 / M_PI;

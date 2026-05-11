@@ -127,6 +127,7 @@ namespace ns3 {
 
             Ptr<LteEnbRrc> GetRrc(void);
 
+
             void SetE2Termination(Ptr<E2Termination> e2term);
 
             Ptr<E2Termination> GetE2Termination() const;
@@ -141,6 +142,18 @@ namespace ns3 {
             void SetStartTime(uint64_t);
 
             void stopSendingAndCancelSchedule();
+
+            /**
+             * Execute a RIC Control Action internally.
+             * This allows driving E2 logic (Handover, Energy Saving) without a full E2 connection.
+             * 
+             * \param styleType The RIC Service Style (e.g., Mobility, Energy)
+             * \param actionId The specific action (e.g., Handover)
+             * \param targetCellId Target cell for handover or power control
+             * \param imsi The IMSI of the UE (for handover)
+             */
+            void ExecRicControl(long styleType, long actionId, int targetCellId, uint64_t imsi);
+
 
         protected:
             virtual void DoInitialize(void) override;

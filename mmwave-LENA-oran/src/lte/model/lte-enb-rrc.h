@@ -74,6 +74,11 @@ class RlcBearerInfo;
 class LteEnbRrc;
 class Packet;
 
+namespace mmwave
+{
+  class MmWaveEnbNetDevice;  // Forward declaration for friend class
+}
+
 typedef std::map<uint64_t, double> ImsiSinrMap;
 typedef std::map<uint16_t, double> CellSinrMap;
 
@@ -447,6 +452,16 @@ public:
      */
     void RecvSecondaryCellHandoverCompleted(EpcX2SapUser::SecondaryHandoverCompletedParams params);
 
+    /**
+     * Switch the UeManager to the given state
+     * 
+     * \param s the given state
+     * 
+     * \note This method is made public to allow ManualHandover() to transition
+     *       UeManager state from HANDOVER_JOINING to CONNECTED_NORMALLY
+     */
+    void SwitchToState(State s);
+
   private:
     // Lossless HO: merge 2 buffers into 1 with increment order.
     std::vector<LteRlcAm::RetxPdu> MergeBuffers(std::vector<LteRlcAm::RetxPdu> first,
@@ -565,13 +580,6 @@ public:
      * \return the corresponding Data Radio Bearer Id
      */
     uint8_t Bid2Drbid(uint8_t bid);
-
-    /**
-     * Switch the UeManager to the given state
-     *
-     * \param s the given state
-     */
-    void SwitchToState(State s);
 
     uint8_t m_lastAllocatedDrbid; ///< last allocated Data Radio Bearer ID
 
@@ -728,6 +736,7 @@ class LteEnbRrc : public Object
     friend class MemberEpcEnbS1SapUser<LteEnbRrc>;
     /// allow MemberEpcEnbS1SapUser<LteEnbRrc> class friend access
     friend class EpcX2SpecificEpcX2SapUser<LteEnbRrc>;
+    /// allow MmWaveEnbNetDevice class friend access for handover operations
     /// allow UeManager class friend access
     friend class UeManager;
     friend class MemberLteEnbCphySapUser<LteEnbRrc>;
@@ -783,6 +792,7 @@ class LteEnbRrc : public Object
      * \return s the X2 SAP User interface offered to the X2 entity by this RRC entity
      */
     EpcX2SapUser* GetEpcX2SapUser();
+
 
     /**
      * Set the X2 PDCP Provider this RRC should pass to PDCP layers
@@ -1557,6 +1567,26 @@ class LteEnbRrc : public Object
    */
   std::map<uint16_t, Ptr<UeManager> > GetUeMap () const;
 
+         /**
+          * Manual handover for custom handover scenarios.
+          *
+          * This method transfers a UE from this cell (source) to a target cell by:
+          *  - Removing the UE from the source cell RRC context
+          *  - Creating a new UeManager in the target cell
+          *  - Registering IMSI-to-RNTI mapping in the target cell
+          *  - Updating RRC state maps used by E2 reporting
+          *
+          * IMPORTANT: This should be called BEFORE updating PHY/MAC layers.
+          * The returned RNTI should be used to add the UE to PHY/MAC after RRC setup.
+          *
+          * \param imsi The IMSI of the UE to handover
+          * \param targetRrc The RRC instance of the target cell
+          * \param targetCellId The cell ID of the target cell
+          * \param targetRnti Output parameter: the allocated RNTI in the target cell
+          * \return true if handover succeeded, false otherwise
+          */
+         bool ManualHandover(uint64_t imsi, Ptr<LteEnbRrc> targetRrc, uint16_t targetCellId, uint16_t& targetRnti);
+
     /**
      * Add a neighbour with an X2 interface
      *
@@ -1984,6 +2014,9 @@ class LteEnbRrc : public Object
     std::map<uint16_t, uint64_t> m_rntiImsiMap;
     // sleep mode for mmWave/NR BSs controlled by the LTE eNB
     std::map<uint16_t, bool> m_allowHandoverTo;  // cellId, true if HO is allowed, false if not
+
+    // X2 neighbor cells for SINR exchange (enables SA mode handover)
+    std::set<uint16_t> m_x2NeighbourCells;  // Set of all X2-connected neighbor cell IDs
 
     HandoverMode m_handoverMode;
 

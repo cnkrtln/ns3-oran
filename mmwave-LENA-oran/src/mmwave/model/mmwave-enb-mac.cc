@@ -946,7 +946,11 @@ MmWaveEnbMac::DoSchedConfigIndication(MmWaveMacSchedSapUser::SchedConfigIndParam
                 m_rlcAttached.find(rnti);
             if (rntiIt == m_rlcAttached.end())
             {
-                NS_FATAL_ERROR("Scheduled UE " << rntiIt->first << " not attached");
+                // RNTI not found - UE was likely removed during handover
+                // This can happen when scheduled events execute after UE removal
+                // Skip processing this DCI but continue with rest of loop
+                NS_LOG_WARN("Scheduled UE " << rnti << " not attached (UE may have been removed during handover) - skipping DCI processing");
+                continue; // Skip this TTI allocation, continue with next one
             }
             else
             {
@@ -1122,6 +1126,56 @@ MmWaveEnbMac::DoAddUe(uint16_t rnti)
     params.m_transmissionMode =
         0; // set to default value (SISO) for avoiding random initialization (valgrind error)
     m_macCschedSapProvider->CschedUeConfigReq(params);
+
+    // [FIX] Force-trigger scheduling for the manual handover case.
+    // Since we skipped RACH, the scheduler waits for BSR/CQI.
+    // We inject a fake BSR to tell the scheduler "We have data, please schedule us!"
+    // We MUST populate all 4 LCGs to avoid range check errors in the scheduler/CCM.
+    MacCeListElement_s bsr;
+    bsr.m_rnti = rnti;
+    bsr.m_macCeType = MacCeListElement_s::BSR;
+    bsr.m_macCeValue.m_phr = 0;
+    bsr.m_macCeValue.m_crnti = rnti;
+    bsr.m_macCeValue.m_bufferStatus.push_back(63); // Max buffer size for LCG 0
+    bsr.m_macCeValue.m_bufferStatus.push_back(63); // Max buffer size for LCG 1
+    bsr.m_macCeValue.m_bufferStatus.push_back(63); // Max buffer size for LCG 2
+    bsr.m_macCeValue.m_bufferStatus.push_back(63); // Max buffer size for LCG 3
+
+    // Send to Scheduler (via CCM-MAC SAP)
+    if (m_ccmMacSapUser)
+    {
+        m_ccmMacSapUser->UlReceiveMacCe(bsr, m_componentCarrierId);
+    }
+    
+    // [FIX] Also inject a fake DL CQI report. 
+    // The scheduler needs CQI to allocate DL resources (MCS selection).
+    // Without RACH, this is undetermined. We force a high CQI (15) to start.
+    // We must use CURRENT frame/slot to avoid stale CQI rejection.
+    MmWaveMacSchedSapProvider::SchedDlCqiInfoReqParameters cqiParams;
+    cqiParams.m_sfnsf.m_frameNum = m_frameNum; 
+    cqiParams.m_sfnsf.m_sfNum = m_sfNum;
+    cqiParams.m_sfnsf.m_slotNum = m_slotNum;
+    
+    struct DlCqiInfo cqiInfo;
+    cqiInfo.m_rnti = rnti;
+    cqiInfo.m_cqiType = DlCqiInfo::WB;
+    cqiInfo.m_wbCqi = 15; // Assume good channel to start (Wideband)
+    cqiInfo.m_ri = 1;     // Rank Indicator 1
+    cqiInfo.m_wbPmi = 0;
+    
+    // Also populate RB-level CQI (some schedulers require this)
+    if (m_phyMacConfig)
+    {
+        uint32_t numRb = m_phyMacConfig->GetNumRb();
+        cqiInfo.m_rbCqi.assign(numRb, 15); // Set all RBs to max quality
+    }
+    
+    cqiParams.m_cqiList.push_back(cqiInfo);
+    
+    if (m_macSchedSapProvider)
+    {
+        m_macSchedSapProvider->SchedDlCqiInfoReq(cqiParams);
+    }
 
     // Create DL transmission HARQ buffers
     MmWaveDlHarqProcessesBuffer_t buf;

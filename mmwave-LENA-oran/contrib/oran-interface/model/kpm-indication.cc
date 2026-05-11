@@ -69,9 +69,10 @@ extern "C" {
 // #include "UEID-GNB.h"
 #include <arpa/inet.h>
 
-#include "conversions.h"
+#include <string.h>
 #include <assert.h>
-#include <cassert>
+#include <errno.h>
+#include "conversions.h"
 #include <any>
 
 // #include "timing_ms.h"

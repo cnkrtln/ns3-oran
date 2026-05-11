@@ -32,6 +32,7 @@
 #include "ns3/ipv4.h"
 #include "ns3/log.h"
 #include "ns3/mac48-address.h"
+#include "ns3/simulator.h"
 #include "ns3/uinteger.h"
 
 namespace ns3
@@ -173,14 +174,56 @@ EpcEnbApplication::DoPathSwitchRequest(EpcEnbS1SapProvider::PathSwitchRequestPar
          bit != params.bearersToBeSwitched.end();
          ++bit)
     {
+        uint32_t teid = bit->teid;
+        
+        // CRITICAL FIX: Check if mapping already exists (from UpdateRntiForTeid in manual handover)
+        // If it exists, use the BID from the existing mapping (which is the correct m_epsBearerIdentity)
+        // Otherwise, use the epsBearerId from PathSwitchRequest
+        uint8_t bid = bit->epsBearerId; // Default to epsBearerId
+        std::map<uint32_t, EpsFlowId_t>::iterator teidIt = m_teidRbidMap.find(teid);
+        if (teidIt != m_teidRbidMap.end())
+        {
+            // Mapping already exists (from UpdateRntiForTeid) - use its BID (which is m_epsBearerIdentity)
+            uint8_t oldBid = teidIt->second.m_bid;
+            bid = teidIt->second.m_bid;
+            // Update RNTI if it changed
+            teidIt->second.m_rnti = params.rnti;
+            
+            // DEBUG: Log BID preservation
+            double timestamp = Simulator::Now().GetSeconds();
+            std::string handoverDebugFileName = "/dev/null";
+            std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+            if (handoverDebugLog.is_open())
+            {
+                handoverDebugLog << timestamp << ",PATH_SWITCH_PRESERVED_BID,Cell" << m_cellId
+                                 << ",IMSI" << imsi << ",TEID=" << teid << ",RNTI=" << params.rnti
+                                 << ",OldBID=" << (uint32_t)oldBid << ",PreservedBID=" << (uint32_t)bid
+                                 << ",EpsBearerId=" << (uint32_t)bit->epsBearerId << std::endl;
+                handoverDebugLog.close();
+            }
+        }
+        else
+        {
+            // DEBUG: Log BID from PathSwitchRequest (mapping didn't exist)
+            double timestamp = Simulator::Now().GetSeconds();
+            std::string handoverDebugFileName = "/dev/null";
+            std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+            if (handoverDebugLog.is_open())
+            {
+                handoverDebugLog << timestamp << ",PATH_SWITCH_NEW_MAPPING,Cell" << m_cellId
+                                 << ",IMSI" << imsi << ",TEID=" << teid << ",RNTI=" << params.rnti
+                                 << ",BID=" << (uint32_t)bid << ",EpsBearerId=" << (uint32_t)bit->epsBearerId << std::endl;
+                handoverDebugLog.close();
+            }
+        }
+        
         EpsFlowId_t flowId;
         flowId.m_rnti = params.rnti;
-        flowId.m_bid = bit->epsBearerId;
-        uint32_t teid = bit->teid;
-
-        EpsFlowId_t rbid(params.rnti, bit->epsBearerId);
+        flowId.m_bid = bid;
+        
+        EpsFlowId_t rbid(params.rnti, bid);
         // side effect: create entries if not exist
-        m_rbidTeidMap[params.rnti][bit->epsBearerId] = teid;
+        m_rbidTeidMap[params.rnti][bid] = teid;
         m_teidRbidMap[teid] = rbid;
 
         EpcS1apSapMme::ErabSwitchedInDownlinkItem erab;
@@ -259,11 +302,35 @@ EpcEnbApplication::DoPathSwitchRequestAcknowledge(
     NS_LOG_FUNCTION(this);
 
     uint64_t imsi = mmeUeS1Id;
+    
+    // DEBUG: Log PathSwitchRequestAcknowledge received
+    double timestamp = Simulator::Now().GetSeconds();
+    std::string handoverDebugFileName = "/dev/null";
+    std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",ENB_PATH_SWITCH_ACK_RECEIVED,Cell" << m_cellId 
+                         << ",IMSI" << imsi << ",EnbUeS1Id=" << enbUeS1Id 
+                         << ",CellId=" << gci << std::endl;
+        handoverDebugLog.close();
+      }
+    
     std::map<uint64_t, uint16_t>::iterator imsiIt = m_imsiRntiMap.find(imsi);
     NS_ASSERT_MSG(imsiIt != m_imsiRntiMap.end(), "unknown IMSI");
     uint16_t rnti = imsiIt->second;
     EpcEnbS1SapUser::PathSwitchRequestAcknowledgeParameters params;
     params.rnti = rnti;
+    
+    // DEBUG: Log forwarding to RRC
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",ENB_PATH_SWITCH_ACK_FORWARDING,Cell" << m_cellId 
+                         << ",IMSI" << imsi << ",RNTI" << rnti << std::endl;
+        handoverDebugLog.close();
+      }
+    
     m_s1SapUser->PathSwitchRequestAcknowledge(params);
 }
 
@@ -325,11 +392,33 @@ EpcEnbApplication::RecvFromS1uSocket(Ptr<Socket> socket)
     std::map<uint32_t, EpsFlowId_t>::iterator it = m_teidRbidMap.find(teid);
     if (it != m_teidRbidMap.end())
     {
+        // DEBUG: Log successful packet processing
+        double timestamp = Simulator::Now().GetSeconds();
+        std::string handoverDebugFileName = "/dev/null";
+        std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+        if (handoverDebugLog.is_open())
+          {
+            handoverDebugLog << timestamp << ",S1U_PACKET_PROCESSED,Cell" << m_cellId 
+                             << ",TEID=" << teid << ",RNTI=" << it->second.m_rnti 
+                             << ",BID=" << (uint32_t)it->second.m_bid << ",Size=" << packet->GetSize() << std::endl;
+            handoverDebugLog.close();
+          }
+        
         m_rxS1uSocketPktTrace(packet->Copy());
         SendToLteSocket(packet, it->second.m_rnti, it->second.m_bid);
     }
     else
     {
+        // DEBUG: Log discarded packets (TEID mapping not found)
+        double timestamp = Simulator::Now().GetSeconds();
+        std::string handoverDebugFileName = "/dev/null";
+        std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+        if (handoverDebugLog.is_open())
+          {
+            handoverDebugLog << timestamp << ",S1U_PACKET_DISCARDED,Cell" << m_cellId 
+                             << ",TEID=" << teid << ",Reason=TEID_MAPPING_NOT_FOUND" << std::endl;
+            handoverDebugLog.close();
+          }
         packet = 0;
         NS_LOG_DEBUG("UE context not found, discarding packet when receiving from s1uSocket");
     }
@@ -388,6 +477,125 @@ EpcEnbApplication::DoReleaseIndication(uint64_t imsi, uint16_t rnti, uint8_t bea
     // From 3GPP TS 23401-950 Section 5.4.4.2, enB sends EPS bearer Identity in Bearer Release
     // Indication message to MME
     m_s1apSapEnbProvider->SendErabReleaseIndication(imsi, rnti, erabToBeReleaseIndication);
+}
+
+void
+EpcEnbApplication::UpdateRntiForTeid(uint32_t teid, uint16_t oldRnti, uint16_t newRnti, uint8_t bid)
+{
+    NS_LOG_FUNCTION(this << teid << oldRnti << newRnti << (uint16_t)bid);
+    
+    // DEBUG: Log to file
+    double timestamp = Simulator::Now().GetSeconds();
+    std::string handoverDebugFileName = "/dev/null";
+    std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+    
+    // Update m_teidRbidMap: Change RNTI AND BID for this TEID
+    // If mapping doesn't exist, CREATE it (for manual handover where mapping might not exist in target cell)
+    std::map<uint32_t, EpsFlowId_t>::iterator teidIt = m_teidRbidMap.find(teid);
+    if (teidIt != m_teidRbidMap.end())
+    {
+        // CRITICAL FIX: Update BOTH RNTI AND BID in the flow ID
+        // The BID must match m_epsBearerIdentity from the target DRB, otherwise packets
+        // will arrive with the wrong BID and won't be routed correctly
+        uint8_t oldBid = teidIt->second.m_bid;
+        teidIt->second.m_rnti = newRnti;
+        teidIt->second.m_bid = bid;  // Update BID to match m_epsBearerIdentity
+        NS_LOG_INFO("EpcEnbApplication: Updated m_teidRbidMap[TEID=" << teid 
+                    << "] from RNTI " << oldRnti << " to RNTI " << newRnti 
+                    << ", BID from " << (uint16_t)oldBid << " to " << (uint16_t)bid);
+        
+        if (handoverDebugLog.is_open())
+          {
+            handoverDebugLog << timestamp << ",EPC_UPDATE_TEID_FOUND,Cell" << m_cellId 
+                             << ",TEID=" << teid << ",OldRNTI=" << oldRnti 
+                             << ",NewRNTI=" << newRnti << ",OldBID=" << (uint32_t)oldBid
+                             << ",NewBID=" << (uint32_t)bid << ",Action=UPDATED" << std::endl;
+            handoverDebugLog.close();
+          }
+    }
+    else
+    {
+        // CREATE the mapping if it doesn't exist (for manual handover)
+        // This is similar to DoPathSwitchRequest and DoInitialContextSetupRequest
+        EpsFlowId_t rbid(newRnti, bid);
+        m_teidRbidMap[teid] = rbid;
+        NS_LOG_INFO("EpcEnbApplication: Created m_teidRbidMap[TEID=" << teid 
+                    << "] with RNTI " << newRnti << " (mapping did not exist)");
+        
+        if (handoverDebugLog.is_open())
+          {
+            handoverDebugLog << timestamp << ",EPC_UPDATE_TEID_NOT_FOUND,Cell" << m_cellId 
+                             << ",TEID=" << teid << ",OldRNTI=" << oldRnti 
+                             << ",NewRNTI=" << newRnti << ",Action=CREATED" << std::endl;
+            handoverDebugLog.close();
+          }
+    }
+    
+    // Update m_rbidTeidMap: Remove old entry, add new entry
+    // Remove old RNTI->BID->TEID mapping (only if oldRnti != newRnti to avoid removing what we just added)
+    if (oldRnti != newRnti)
+      {
+        std::map<uint16_t, std::map<uint8_t, uint32_t>>::iterator rntiIt = m_rbidTeidMap.find(oldRnti);
+        if (rntiIt != m_rbidTeidMap.end())
+          {
+            std::map<uint8_t, uint32_t>::iterator bidIt = rntiIt->second.find(bid);
+            if (bidIt != rntiIt->second.end() && bidIt->second == teid)
+              {
+                rntiIt->second.erase(bidIt);
+                NS_LOG_INFO("EpcEnbApplication: Removed m_rbidTeidMap[RNTI=" << oldRnti 
+                            << "][BID=" << (uint16_t)bid << "] = TEID " << teid);
+                
+                // If this was the last BID for this RNTI, remove the RNTI entry
+                if (rntiIt->second.empty())
+                  {
+                    m_rbidTeidMap.erase(rntiIt);
+                  }
+              }
+          }
+      }
+    
+    // Add new RNTI->BID->TEID mapping
+    m_rbidTeidMap[newRnti][bid] = teid;
+    NS_LOG_INFO("EpcEnbApplication: Added m_rbidTeidMap[RNTI=" << newRnti 
+                << "][BID=" << (uint16_t)bid << "] = TEID " << teid);
+}
+
+void
+EpcEnbApplication::RemoveTeidMapping(uint32_t teid, uint16_t rnti, uint8_t bid)
+{
+    NS_LOG_FUNCTION(this << teid << rnti << (uint16_t)bid);
+    
+    // Remove from m_teidRbidMap
+    std::map<uint32_t, EpsFlowId_t>::iterator teidIt = m_teidRbidMap.find(teid);
+    if (teidIt != m_teidRbidMap.end())
+    {
+        NS_LOG_INFO("EpcEnbApplication: Removing m_teidRbidMap[TEID=" << teid 
+                    << "] (RNTI " << teidIt->second.m_rnti << ", BID " << (uint16_t)teidIt->second.m_bid << ")");
+        m_teidRbidMap.erase(teidIt);
+    }
+    else
+    {
+        NS_LOG_WARN("EpcEnbApplication: RemoveTeidMapping - TEID " << teid << " not found in m_teidRbidMap");
+    }
+    
+    // Remove from m_rbidTeidMap
+    std::map<uint16_t, std::map<uint8_t, uint32_t>>::iterator rntiIt = m_rbidTeidMap.find(rnti);
+    if (rntiIt != m_rbidTeidMap.end())
+    {
+        std::map<uint8_t, uint32_t>::iterator bidIt = rntiIt->second.find(bid);
+        if (bidIt != rntiIt->second.end() && bidIt->second == teid)
+        {
+            NS_LOG_INFO("EpcEnbApplication: Removing m_rbidTeidMap[RNTI=" << rnti 
+                        << "][BID=" << (uint16_t)bid << "] = TEID " << teid);
+            rntiIt->second.erase(bidIt);
+            
+            // If this was the last BID for this RNTI, remove the RNTI entry
+            if (rntiIt->second.empty())
+            {
+                m_rbidTeidMap.erase(rntiIt);
+            }
+        }
+    }
 }
 
 } // namespace ns3

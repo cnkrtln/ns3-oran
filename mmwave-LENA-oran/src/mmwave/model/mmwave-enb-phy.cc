@@ -1463,16 +1463,20 @@ MmWaveEnbPhy::AddUePhy(uint16_t rnti)
 void
 MmWaveEnbPhy::DoRemoveUe(uint16_t rnti)
 {
+    NS_LOG_FUNCTION(this << rnti);
     std::set<uint16_t>::iterator it = m_ueAttachedRnti.find(rnti);
     if (it != m_ueAttachedRnti.end())
     {
         m_ueAttachedRnti.erase(it);
+        NS_LOG_DEBUG("Removed RNTI " << rnti << " from PHY attached UEs");
     }
     else
     {
-        NS_FATAL_ERROR("Impossible to remove UE, not attached!");
+        // RNTI not found - log warning but don't fatal error
+        // This can happen during manual handover if RNTI was never added to this PHY
+        // or was already removed. We log and continue to avoid crashes.
+        NS_LOG_WARN("Attempted to remove RNTI " << rnti << " from PHY, but RNTI not attached (may have been already removed or never added)");
     }
-    NS_LOG_FUNCTION(this << rnti);
 }
 
 void

@@ -44,6 +44,8 @@
 #include <ns3/lte-enb-rrc.h>
 #include <ns3/lte-ue-net-device.h>
 #include <ns3/lte-ue-rrc.h>
+#include <ns3/mmwave-enb-net-device.h>
+#include <ns3/node-list.h>
 
 namespace ns3
 {
@@ -1276,7 +1278,20 @@ MmWaveBearerStatsConnector::DisconnectTracesEnb(std::string context,
                                                 uint16_t cellId,
                                                 uint16_t rnti)
 {
-    NS_LOG_FUNCTION(this);
+    NS_LOG_FUNCTION(this << context << imsi << cellId << rnti);
+    
+    // CRITICAL FIX: Remove IMSI from seen set so target cell can reconnect stats!
+    // This was missing, causing both X2 and manual handover to fail throughput collection
+    auto it = m_imsiSeenEnbDrb.find(imsi);
+    if (it != m_imsiSeenEnbDrb.end())
+    {
+        NS_LOG_UNCOND("DisconnectTracesEnb: Removing IMSI " << imsi << " from seen set for cell " << cellId);
+        m_imsiSeenEnbDrb.erase(it);
+    }
+    else
+    {
+        NS_LOG_UNCOND("DisconnectTracesEnb: IMSI " << imsi << " was NOT in seen set for cell " << cellId);
+    }
 }
 
 void
@@ -1364,6 +1379,56 @@ MmWaveBearerStatsConnector::ConnectSecondaryTracesEnb(std::string context,
                          MakeBoundCallback (&DlTxPduCallback, arg));
       }
     }
+}
+
+void
+MmWaveBearerStatsConnector::ForceReconnectStatsForUe(uint64_t imsi, uint16_t rnti, uint16_t cellId)
+{
+    NS_LOG_FUNCTION(this << imsi << rnti << cellId);
+    
+    // Clear the IMSI from "seen" sets so ConnectTracesEnbIfFirstTime will reconnect
+    // This mimics what normal X2 handover does when disconnecting from source cell
+    auto it = m_imsiSeenEnbDrb.find(imsi);
+    if (it != m_imsiSeenEnbDrb.end())
+    {
+        NS_LOG_INFO("ForceReconnectStatsForUe: Clearing IMSI " << imsi << " from seen set");
+        m_imsiSeenEnbDrb.erase(it);
+    }
+    
+    // Now manually trigger the connection by calling ConnectDrbTracesEnb
+    // We need to build the context path similar to what the trace callback receives
+    // Context format: /NodeList/X/DeviceList/Y/LteEnbRrc
+    
+    // Find the eNB device for this cell
+    for (NodeList::Iterator nodeIt = NodeList::Begin(); nodeIt != NodeList::End(); ++nodeIt)
+    {
+        Ptr<Node> node = *nodeIt;
+        for (uint32_t devIdx = 0; devIdx < node->GetNDevices(); ++devIdx)
+        {
+            Ptr<NetDevice> dev = node->GetDevice(devIdx);
+            
+            // Check if this is an eNB with our target cell
+            Ptr<mmwave::MmWaveEnbNetDevice> mmDev = dev->GetObject<mmwave::MmWaveEnbNetDevice>();
+            if (mmDev && mmDev->GetCellId() == cellId)
+            {
+                // Build context path
+                std::ostringstream contextPath;
+                contextPath << "/NodeList/" << node->GetId() 
+                           << "/DeviceList/" << devIdx 
+                           << "/LteEnbRrc/ForceReconnect";
+                
+                NS_LOG_INFO("ForceReconnectStatsForUe: Reconnecting stats for IMSI " << imsi 
+                           << " at RNTI " << rnti << " in cell " << cellId
+                           << " (context: " << contextPath.str() << ")");
+                
+                // Call ConnectDrbTracesEnb directly (bypasses the "IfFirstTime" check)
+                ConnectDrbTracesEnb(contextPath.str(), imsi, cellId, rnti);
+                return;
+            }
+        }
+    }
+    
+    NS_LOG_WARN("ForceReconnectStatsForUe: Could not find eNB device for cell " << cellId);
 }
 
 } // namespace mmwave

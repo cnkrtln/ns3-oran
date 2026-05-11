@@ -142,6 +142,7 @@ set(header_files
     model/error-model/mmwave-eesm-ir.h
     model/error-model/mmwave-eesm-t1.h
     model/error-model/mmwave-eesm-t2.h
+    model/node-container-manager.h
 )
 
 build_lib(

@@ -585,15 +585,42 @@ MmWaveSpectrumPhy::EndRxData ()
   auto itTb = m_transportBlocks.begin ();
   while (itTb != m_transportBlocks.end ())
     {
-      // compute the average SINR
-      itTb->second.m_sinrAvg =
-          Sum (m_sinrPerceived) / (m_sinrPerceived.GetSpectrumModel ()->GetNumBands ());
-      itTb->second.m_sinrMin = MmWaveSpectrumPhy::Min (m_sinrPerceived);
-      NS_LOG_DEBUG ("m_sinrPerceived="
+      // FIXED: Compute average SINR only over allocated (non-zero) bands
+      // Previous bug: Averaged over ALL bands including unused ones with 0 SINR,
+      // causing ~3000x deflation (e.g., 29 dB became -28 dB)
+      double sinrSum = 0.0;
+      size_t allocatedBands = 0;
+      size_t numBands = m_sinrPerceived.GetSpectrumModel()->GetNumBands();
+      
+      for (size_t i = 0; i < numBands; i++)
+      {
+        if (m_sinrPerceived[i] > 0.0)
+        {
+          sinrSum += m_sinrPerceived[i];
+          allocatedBands++;
+        }
+      }
+      
+      // Average over allocated bands only
+      if (allocatedBands > 0)
+      {
+        itTb->second.m_sinrAvg = sinrSum / allocatedBands;
+      }
+      else
+      {
+        // Fallback: no allocated bands (shouldn't happen)
+        itTb->second.m_sinrAvg = 0.0;
+      }
+      
+      itTb->second.m_sinrMin = MmWaveSpectrumPhy::Min(m_sinrPerceived);
+      
+      NS_LOG_DEBUG("m_sinrPerceived="
                     << m_sinrPerceived << ", sinrMin=" << itTb->second.m_sinrMin
                     << ", sinrAvg=" << itTb->second.m_sinrAvg
-                    << ", Avg SINR dB=" << 10 * std::log10 (itTb->second.m_sinrAvg)
-                    << ", GetNumBands=" << m_sinrPerceived.GetSpectrumModel ()->GetNumBands ());
+                    << ", Avg SINR dB=" << 10 * std::log10(itTb->second.m_sinrAvg)
+                    << ", Allocated bands=" << allocatedBands << "/" << numBands);
+
+
 
       if ((m_dataErrorModelEnabled) && (m_rxPacketBurstList.size () > 0))
         {

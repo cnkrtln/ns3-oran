@@ -26,6 +26,9 @@
  *       Abdelrhman Soliman <abdelrhman.soliman.ext@orange.com>
  */
 
+#include <string.h>
+#include <assert.h>
+#include <errno.h>
 #include <ns3/kpm-function-description.h>
 #include <ns3/asn1c-types.h>
 #include <ns3/log.h>

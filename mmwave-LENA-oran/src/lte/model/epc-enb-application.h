@@ -150,6 +150,28 @@ class EpcEnbApplication : public Application
         friend bool operator<(const EpsFlowId_t& a, const EpsFlowId_t& b);
     };
 
+    /**
+     * Update RNTI for a given TEID after handover
+     * This is called when a UE handovers and gets a new RNTI in the target cell
+     * 
+     * \param teid the Tunnel Endpoint Identifier
+     * \param oldRnti the old RNTI (before handover)
+     * \param newRnti the new RNTI (after handover)
+     * \param bid the Bearer ID
+     */
+    void UpdateRntiForTeid(uint32_t teid, uint16_t oldRnti, uint16_t newRnti, uint8_t bid);
+
+    /**
+     * Remove TEID mapping from source cell after handover
+     * This is called to remove the TEID mapping from the source cell so packets
+     * from S1-U will be routed to the target cell instead
+     * 
+     * \param teid the Tunnel Endpoint Identifier
+     * \param rnti the RNTI (before handover)
+     * \param bid the Bearer ID
+     */
+    void RemoveTeidMapping(uint32_t teid, uint16_t rnti, uint8_t bid);
+
   private:
     // ENB S1 SAP provider methods
     void DoInitialUeMessage(uint64_t imsi, uint16_t rnti);
@@ -190,6 +212,7 @@ class EpcEnbApplication : public Application
      */
     void SendToS1uSocket(Ptr<Packet> packet, uint32_t teid);
 
+  private:
     /**
      * internal method used for the actual setup of the S1 Bearer
      *

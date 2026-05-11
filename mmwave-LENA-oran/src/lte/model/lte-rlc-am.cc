@@ -36,6 +36,7 @@
 #include "ns3/lte-rlc-tag.h"
 #include "ns3/simulator.h"
 #include "ns3/string.h"
+#include <fstream>
 
 namespace ns3
 {
@@ -245,12 +246,18 @@ LteRlcAm::DoTransmitPdcpPdu(Ptr<Packet> p)
   ++m_txPacketsInReportingPeriod;
   m_txBytesInReportingPeriod += p->GetSize();
 
+  // DEBUG: Log RLC receiving from PDCP (before adding to buffer)
+  double timestamp = Simulator::Now().GetSeconds();
+  uint32_t bufferSizeBefore = m_txonBufferSize;
+  std::string rlcDebugFileName = "/dev/null";
+  std::ofstream rlcDebugLog(rlcDebugFileName.c_str(), std::ios::app);
+
   if(m_enableAqm == false)
   {
     if (m_txonBufferSize + p->GetSize () <= m_maxTxBufferSize)
-    {
+      {
         if (m_txonBufferSize + p->GetSize() <= m_maxTxBufferSize)
-        {
+          {
             /** Store arrival time */
             Time now = Simulator::Now();
             RlcTag timeTag(now);
@@ -267,7 +274,18 @@ LteRlcAm::DoTransmitPdcpPdu(Ptr<Packet> p)
             m_txonBufferSize += p->GetSize();
             NS_LOG_LOGIC("NumOfBuffers = " << m_txonBuffer.size());
             NS_LOG_LOGIC("txonBufferSize = " << m_txonBufferSize);
-        }
+            
+            // DEBUG: Log RLC buffer update
+            if (rlcDebugLog.is_open())
+              {
+                rlcDebugLog << timestamp << ",RLC_RECEIVED_PDU,RNTI" << m_rnti
+                           << ",LCID=" << (uint32_t)m_lcid << ",Size=" << p->GetSize()
+                           << ",BufferBefore=" << bufferSizeBefore
+                           << ",BufferAfter=" << m_txonBufferSize
+                           << ",NumPackets=" << m_txonBuffer.size() << std::endl;
+                rlcDebugLog.close();
+              }
+          }
         else
         {
             // Discard full RLC SDU
@@ -275,6 +293,16 @@ LteRlcAm::DoTransmitPdcpPdu(Ptr<Packet> p)
             NS_LOG_LOGIC("MaxTxBufferSize = " << m_maxTxBufferSize);
             NS_LOG_LOGIC("txonBufferSize    = " << m_txonBufferSize);
             NS_LOG_LOGIC("packet size     = " << p->GetSize());
+            
+            // DEBUG: Log buffer full
+            if (rlcDebugLog.is_open())
+              {
+                rlcDebugLog << timestamp << ",RLC_BUFFER_FULL,RNTI" << m_rnti
+                           << ",LCID=" << (uint32_t)m_lcid << ",Size=" << p->GetSize()
+                           << ",BufferSize=" << m_txonBufferSize
+                           << ",MaxSize=" << m_maxTxBufferSize << std::endl;
+                rlcDebugLog.close();
+              }
         }
     }
     else // Use CoDel queue
@@ -296,6 +324,15 @@ LteRlcAm::DoTransmitPdcpPdu(Ptr<Packet> p)
         Address dest;
         item = Create<Ipv4QueueDiscItem>(p, dest, 0, ipv4Header);
         m_txonQueue->Enqueue(item);
+        
+        // DEBUG: Log RLC buffer update (AQM mode)
+        if (rlcDebugLog.is_open())
+          {
+            rlcDebugLog << timestamp << ",RLC_RECEIVED_PDU_AQM,RNTI" << m_rnti
+                       << ",LCID=" << (uint32_t)m_lcid << ",Size=" << p->GetSize()
+                       << ",QueueSize=" << m_txonQueue->GetNPackets() << std::endl;
+            rlcDebugLog.close();
+          }
     }
 
     /** Report Buffer Status */

@@ -30,6 +30,13 @@
 #ifndef KPM_INDICATION_H
 #define KPM_INDICATION_H
 
+// Include standard C headers FIRST, before any ns3 headers to avoid conflicts
+#include <cstring>
+#include <cassert>
+#include <cerrno>
+#include <string.h>
+#include <assert.h>
+#include <errno.h>
 #include <thread>
 #include "ns3/object.h"
 #include <set>
@@ -323,7 +330,7 @@ public:
     };
     assert (dst.buf != NULL);
 
-    memcpy (dst.buf, &src, 1);
+    std::memcpy (dst.buf, &src, 1);
 
     return dst;
   }
@@ -354,7 +361,7 @@ public:
 
     BIT_STRING_t dst = {.buf = (uint8_t *) malloc (1), .size = 1, .bits_unused = 2};
     assert (dst.buf != NULL);
-    memcpy (dst.buf, &tmp, 1);
+    std::memcpy (dst.buf, &tmp, 1);
 
     return dst;
   }

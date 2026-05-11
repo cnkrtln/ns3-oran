@@ -25,6 +25,7 @@
 #include "ns3/lte-pdcp-sap.h"
 #include "ns3/lte-pdcp-tag.h"
 #include "ns3/simulator.h"
+#include <fstream>
 
 namespace ns3
 {
@@ -200,6 +201,31 @@ LtePdcp::DoTransmitPdcpSdu(Ptr<Packet> p)
     params.rnti = m_rnti;
     params.lcid = m_lcid;
     params.pdcpPdu = p;
+
+    // DEBUG: Log PDCP forwarding to RLC
+    double timestamp = Simulator::Now().GetSeconds();
+    std::string pdcpDebugFileName = "/dev/null";
+    std::ofstream pdcpDebugLog(pdcpDebugFileName.c_str(), std::ios::app);
+    if (pdcpDebugLog.is_open())
+      {
+        pdcpDebugLog << timestamp << ",PDCP_TO_RLC,RNTI" << m_rnti
+                     << ",LCID=" << (uint32_t)m_lcid << ",Size=" << p->GetSize() << std::endl;
+        pdcpDebugLog.close();
+      }
+
+    // CRITICAL: Ensure RLC SAP provider is valid before calling
+    if (m_rlcSapProvider == 0)
+      {
+        NS_LOG_ERROR("PDCP: RLC SAP Provider is NULL for RNTI " << m_rnti << " LCID " << (uint32_t)m_lcid);
+        if (pdcpDebugLog.is_open())
+          {
+            pdcpDebugLog.open(pdcpDebugFileName.c_str(), std::ios::app);
+            pdcpDebugLog << timestamp << ",PDCP_TO_RLC_ERROR,RNTI" << m_rnti
+                         << ",LCID=" << (uint32_t)m_lcid << ",ERROR=RLC_SAP_PROVIDER_NULL" << std::endl;
+            pdcpDebugLog.close();
+          }
+        return; // Don't crash, just skip
+      }
 
     m_rlcSapProvider->TransmitPdcpPdu(params);
 }

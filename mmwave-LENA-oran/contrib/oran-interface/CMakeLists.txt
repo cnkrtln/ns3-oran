@@ -4,8 +4,9 @@ include_directories(/usr/local/include/e2sim)
 link_directories(/usr/local/lib)
 link_libraries(e2sim)
 
-# Add ns3 include directory from build folder
-include_directories(${CMAKE_BINARY_DIR}/include/ns3)
+# Add ns3 include root directory from build folder (so we can include <ns3/...>
+# without shadowing standard headers like <string.h>)
+include_directories(${CMAKE_BINARY_DIR}/include)
 
 # Define the source files
 set(source_files

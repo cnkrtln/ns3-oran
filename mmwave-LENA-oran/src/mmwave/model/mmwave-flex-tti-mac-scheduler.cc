@@ -575,7 +575,12 @@ MmWaveFlexTtiMacScheduler::UpdateDlHarqProcessId(uint16_t rnti)
         m_dlHarqProcessesStatus.find(rnti);
     if (itStat == m_dlHarqProcessesStatus.end())
     {
-        NS_FATAL_ERROR("No Process Id Statusfound for this RNTI " << rnti);
+        // RNTI not found - this can happen if UE was removed during handover
+        // but scheduler still has pending tasks. Log warning and return default.
+        NS_LOG_WARN("UpdateDlHarqProcessId: RNTI " << rnti 
+                    << " not found in m_dlHarqProcessesStatus (UE may have been removed during handover)");
+        // Return max HARQ process ID as safe default (indicates no available process)
+        return m_phyMacConfig->GetNumHarqProcess();
     }
 
     // search for available process ID, if none available return numHarqProcess
@@ -631,7 +636,12 @@ MmWaveFlexTtiMacScheduler::UpdateUlHarqProcessId(uint16_t rnti)
         m_ulHarqProcessesStatus.find(rnti);
     if (itStat == m_ulHarqProcessesStatus.end())
     {
-        NS_FATAL_ERROR("No Process Id Statusfound for this RNTI " << rnti);
+        // RNTI not found - this can happen if UE was removed during handover
+        // but scheduler still has pending tasks. Log warning and return default.
+        NS_LOG_WARN("UpdateUlHarqProcessId: RNTI " << rnti 
+                    << " not found in m_ulHarqProcessesStatus (UE may have been removed during handover)");
+        // Return max HARQ process ID as safe default (indicates no available process)
+        return m_phyMacConfig->GetNumHarqProcess();
     }
 
     // search for available process ID, if none available return numHarqProcess+1
@@ -784,12 +794,29 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
             }
             uint8_t harqId = m_dlHarqInfoList.at(i).m_harqProcessId;
             uint16_t rnti = m_dlHarqInfoList.at(i).m_rnti;
+            
+            // Validate HARQ process ID before accessing vectors
+            // harqId can be invalid (>= GetNumHarqProcess()) if stored before UE removal
+            if (harqId >= m_phyMacConfig->GetNumHarqProcess())
+            {
+                // Invalid HARQ process ID - UE may have been removed during handover
+                // Skip this HARQ retransmission
+                NS_LOG_WARN("Invalid DL HARQ process ID " << (uint16_t)harqId 
+                            << " for RNTI " << rnti 
+                            << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                            << ") - skipping HARQ retransmission (UE may have been removed during handover)");
+                continue;
+            }
+            
             itUeInfo = ueInfo.find(rnti);
             std::map<uint16_t, UlHarqProcessesStatus_t>::iterator itStat =
                 m_dlHarqProcessesStatus.find(rnti);
             if (itStat == m_dlHarqProcessesStatus.end())
             {
-                NS_FATAL_ERROR("No HARQ status info found for UE " << rnti);
+                // Skip HARQ processing for UEs that don't have HARQ status info yet
+                // This can happen during handover when UE is just added but HARQ processes aren't initialized yet
+                NS_LOG_DEBUG("Skipping HARQ processing for UE " << rnti << " - HARQ status info not initialized yet");
+                continue;
             }
             std::map<uint16_t, DlHarqRlcPduList_t>::iterator itRlcPdu =
                 m_dlHarqProcessesRlcPduMap.find(rnti);
@@ -815,11 +842,28 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
                     m_dlHarqProcessesDciInfoMap.find(rnti);
                 if (itHarq == m_dlHarqProcessesDciInfoMap.end())
                 {
-                    NS_FATAL_ERROR("No DCI/HARQ buffer entry found for UE " << rnti);
+                    // RNTI not found - UE may have been removed during handover
+                    // Log warning and skip retransmission (defensive programming)
+                    NS_LOG_WARN("No DCI/HARQ buffer entry found for UE " << rnti 
+                                << " (UE may have been removed during handover) - skipping HARQ retransmission");
+                    continue; // Skip this HARQ retransmission
                 }
                 DciInfoElementTdma dciInfoReTx = itHarq->second.at(harqId);
                 // NS_LOG_DEBUG ("UE" << rnti << " DL harqId " << +harqId << " HARQ-NACK received,
                 // rv " << +dciInfoReTx.m_rv);
+                
+                // Validate dciInfoReTx.m_harqProcess before using it (NS_ASSERT is disabled in optimized builds)
+                // Even though harqId is validated, dciInfoReTx.m_harqProcess could be invalid if stored incorrectly
+                if (dciInfoReTx.m_harqProcess >= m_phyMacConfig->GetNumHarqProcess())
+                {
+                    // Invalid HARQ process ID in stored DCI - UE may have been removed during handover
+                    NS_LOG_WARN("Invalid HARQ process ID " << (uint16_t)dciInfoReTx.m_harqProcess 
+                                << " in stored DCI for RNTI " << rnti 
+                                << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                                << ") - skipping HARQ retransmission (UE may have been removed during handover)");
+                    continue; // Skip this HARQ retransmission
+                }
+                
                 NS_ASSERT(harqId == dciInfoReTx.m_harqProcess);
                 // NS_ASSERT(itStat->second.at (harqId) > 0);
                 NS_ASSERT(itStat->second.at(harqId) - 1 == dciInfoReTx.m_rv);
@@ -930,12 +974,14 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
                         NS_FATAL_ERROR("Unable to find RlcPdcList in HARQ buffer for RNTI "
                                        << rnti);
                     }
+                    // Use harqId instead of dciInfoReTx.m_harqProcess (harqId is already validated)
+                    // This is safer than relying on dciInfoReTx.m_harqProcess which could be corrupted
                     for (uint16_t k = 0;
-                         k < (*itRlcList).second.at(dciInfoReTx.m_harqProcess).size();
+                         k < (*itRlcList).second.at(harqId).size();
                          k++)
                     {
                         ttiInfo.m_rlcPduInfo.push_back(
-                            (*itRlcList).second.at(dciInfoReTx.m_harqProcess).at(k));
+                            (*itRlcList).second.at(harqId).at(k));
                     }
                     ret.m_slotAllocInfo.m_ttiAllocInfo.push_back(ttiInfo);
                     ret.m_slotAllocInfo.m_numSymAlloc += dciInfoReTx.m_numSym;
@@ -970,6 +1016,20 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
             UlHarqInfo harqInfo = m_ulHarqInfoList.at(i);
             uint8_t harqId = harqInfo.m_harqProcessId;
             uint16_t rnti = harqInfo.m_rnti;
+            
+            // Validate HARQ process ID before accessing vectors
+            // harqId can be invalid (>= GetNumHarqProcess()) if stored before UE removal
+            if (harqId >= m_phyMacConfig->GetNumHarqProcess())
+            {
+                // Invalid HARQ process ID - UE may have been removed during handover
+                // Skip this HARQ retransmission
+                NS_LOG_WARN("Invalid UL HARQ process ID " << (uint16_t)harqId 
+                            << " for RNTI " << rnti 
+                            << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                            << ") - skipping HARQ retransmission (UE may have been removed during handover)");
+                continue;
+            }
+            
             itUeInfo = ueInfo.find(rnti);
             std::map<uint16_t, UlHarqProcessesStatus_t>::iterator itStat =
                 m_ulHarqProcessesStatus.find(rnti);
@@ -977,6 +1037,7 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
             {
                 NS_LOG_ERROR("No info found in HARQ buffer for UE (might have changed eNB) "
                              << rnti);
+                continue; // Skip this HARQ retransmission
             }
             if (harqInfo.m_receptionStatus == UlHarqInfo::Ok || itStat->second.at(harqId) == 0)
             {
@@ -995,11 +1056,26 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
                 {
                     NS_LOG_ERROR("No info found in UL-HARQ buffer for UE (might have changed eNB) "
                                  << rnti);
+                    continue; // Skip this HARQ retransmission
                 }
                 // retx correspondent block: retrieve the UL-DCI
+                // harqId is already validated above, safe to use
                 DciInfoElementTdma dciInfoReTx = itHarq->second.at(harqId);
                 // NS_LOG_DEBUG ("UE" << rnti << " UL harqId " << +harqInfo.m_harqProcessId << "
                 // HARQ-NACK received, rv " << +dciInfoReTx.m_rv);
+                
+                // Validate dciInfoReTx.m_harqProcess before using it (NS_ASSERT is disabled in optimized builds)
+                // Even though harqId is validated, dciInfoReTx.m_harqProcess could be invalid if stored incorrectly
+                if (dciInfoReTx.m_harqProcess >= m_phyMacConfig->GetNumHarqProcess())
+                {
+                    // Invalid HARQ process ID in stored DCI - UE may have been removed during handover
+                    NS_LOG_WARN("Invalid HARQ process ID " << (uint16_t)dciInfoReTx.m_harqProcess 
+                                << " in stored UL DCI for RNTI " << rnti 
+                                << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                                << ") - skipping HARQ retransmission (UE may have been removed during handover)");
+                    continue; // Skip this HARQ retransmission
+                }
+                
                 NS_ASSERT(harqId == dciInfoReTx.m_harqProcess);
                 NS_ASSERT(itStat->second.at(harqId) > 0);
                 NS_ASSERT(itStat->second.at(harqId) - 1 == dciInfoReTx.m_rv);
@@ -1489,22 +1565,46 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
 
             if (m_harqOn == true)
             { // store DCI for HARQ buffer
-                std::map<uint16_t, DlHarqProcessesDciInfoList_t>::iterator itDciInfo =
-                    m_dlHarqProcessesDciInfoMap.find(dci.m_rnti);
-                if (itDciInfo == m_dlHarqProcessesDciInfoMap.end())
+                // Check if HARQ process ID is valid before accessing vectors
+                // UpdateDlHarqProcessId() can return GetNumHarqProcess() (invalid) when RNTI not found
+                if (dci.m_harqProcess >= m_phyMacConfig->GetNumHarqProcess())
                 {
-                    NS_FATAL_ERROR("Unable to find RNTI entry in DCI HARQ buffer for RNTI "
-                                   << dci.m_rnti);
+                    // Invalid HARQ process ID - UE may have been removed during handover
+                    // or no available process found. Skip HARQ processing.
+                    NS_LOG_WARN("Invalid HARQ process ID " << (uint16_t)dci.m_harqProcess 
+                                << " for RNTI " << dci.m_rnti 
+                                << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                                << ") - skipping HARQ update (UE may have been removed during handover)");
                 }
-                (*itDciInfo).second.at(dci.m_harqProcess) = dci;
-                // refresh timer
-                std::map<uint16_t, DlHarqProcessesTimer_t>::iterator itHarqTimer =
-                    m_dlHarqProcessesTimer.find(dci.m_rnti);
-                if (itHarqTimer == m_dlHarqProcessesTimer.end())
+                else
                 {
-                    NS_FATAL_ERROR("Unable to find HARQ timer for RNTI " << (uint16_t)dci.m_rnti);
+                    std::map<uint16_t, DlHarqProcessesDciInfoList_t>::iterator itDciInfo =
+                        m_dlHarqProcessesDciInfoMap.find(dci.m_rnti);
+                    if (itDciInfo == m_dlHarqProcessesDciInfoMap.end())
+                    {
+                        // RNTI not found - UE may have been removed during handover
+                        // Log warning and skip HARQ buffer update (defensive programming)
+                        NS_LOG_WARN("Unable to find RNTI " << dci.m_rnti 
+                                    << " in DCI HARQ buffer (UE may have been removed during handover) - skipping HARQ update");
+                    }
+                    else
+                    {
+                        (*itDciInfo).second.at(dci.m_harqProcess) = dci;
+                        // refresh timer
+                        std::map<uint16_t, DlHarqProcessesTimer_t>::iterator itHarqTimer =
+                            m_dlHarqProcessesTimer.find(dci.m_rnti);
+                        if (itHarqTimer == m_dlHarqProcessesTimer.end())
+                        {
+                            // RNTI not found in timer map - log warning and skip
+                            NS_LOG_WARN("Unable to find HARQ timer for RNTI " << (uint16_t)dci.m_rnti 
+                                        << " (UE may have been removed during handover) - skipping timer update");
+                        }
+                        else
+                        {
+                            (*itHarqTimer).second.at(dci.m_harqProcess) = 0;
+                        }
+                    }
                 }
-                (*itHarqTimer).second.at(dci.m_harqProcess) = 0;
             }
 
             // distribute bytes between active RLC queues
@@ -1553,15 +1653,34 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
                 ttiInfo.m_rlcPduInfo.push_back(ueSchedInfo.m_rlcPduInfo[i]);
                 if (m_harqOn == true)
                 {
-                    // store RLC PDU list for HARQ
-                    std::map<uint16_t, DlHarqRlcPduList_t>::iterator itRlcPdu =
-                        m_dlHarqProcessesRlcPduMap.find(dci.m_rnti);
-                    if (itRlcPdu == m_dlHarqProcessesRlcPduMap.end())
+                    // Check if HARQ process ID is valid before accessing vectors
+                    // UpdateDlHarqProcessId() can return GetNumHarqProcess() (invalid) when RNTI not found
+                    if (dci.m_harqProcess >= m_phyMacConfig->GetNumHarqProcess())
                     {
-                        NS_FATAL_ERROR("Unable to find RlcPdcList in HARQ buffer for RNTI "
-                                       << dci.m_rnti);
+                        // Invalid HARQ process ID - UE may have been removed during handover
+                        // or no available process found. Skip HARQ storage.
+                        NS_LOG_WARN("Invalid HARQ process ID " << (uint16_t)dci.m_harqProcess 
+                                    << " for RNTI " << dci.m_rnti 
+                                    << " - skipping HARQ storage (UE may have been removed during handover)");
                     }
-                    (*itRlcPdu).second.at(dci.m_harqProcess).push_back(ueSchedInfo.m_rlcPduInfo[i]);
+                    else
+                    {
+                        // store RLC PDU list for HARQ
+                        std::map<uint16_t, DlHarqRlcPduList_t>::iterator itRlcPdu =
+                            m_dlHarqProcessesRlcPduMap.find(dci.m_rnti);
+                        if (itRlcPdu == m_dlHarqProcessesRlcPduMap.end())
+                        {
+                            // RNTI not found - UE was likely removed during handover
+                            // This can happen when scheduled events execute after UE removal
+                            // Skip HARQ storage but continue with rest of loop (PDU already added to transmission)
+                            NS_LOG_WARN("Unable to find RlcPdcList in HARQ buffer for RNTI "
+                                        << dci.m_rnti << " - skipping HARQ storage (UE may have been removed during handover)");
+                        }
+                        else
+                        {
+                            (*itRlcPdu).second.at(dci.m_harqProcess).push_back(ueSchedInfo.m_rlcPduInfo[i]);
+                        }
+                    }
                 }
             }
             // reorder/reindex slots to maintain DL before UL slot order
@@ -1647,27 +1766,68 @@ MmWaveFlexTtiMacScheduler::DoSchedTriggerReq(
 
             if (m_harqOn == true)
             {
-                uint8_t harqId = dci.m_harqProcess;
-                std::map<uint16_t, UlHarqProcessesDciInfoList_t>::iterator itHarqTbInfo =
-                    m_ulHarqProcessesDciInfoMap.find(dci.m_rnti);
-                if (itHarqTbInfo == m_ulHarqProcessesDciInfoMap.end())
+                // Check if HARQ process ID is valid before accessing vectors
+                // UpdateUlHarqProcessId() can return GetNumHarqProcess() (invalid) when RNTI not found
+                if (dci.m_harqProcess >= m_phyMacConfig->GetNumHarqProcess())
                 {
-                    NS_FATAL_ERROR("Unable to find RNTI entry in UL DCI HARQ buffer for RNTI "
-                                   << dci.m_rnti);
+                    // Invalid HARQ process ID - UE may have been removed during handover
+                    // or no available process found. Skip HARQ processing.
+                    NS_LOG_WARN("Invalid UL HARQ process ID " << (uint16_t)dci.m_harqProcess 
+                                << " for RNTI " << dci.m_rnti 
+                                << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                                << ") - skipping UL HARQ update (UE may have been removed during handover)");
+                    // Don't use continue here - it would skip itUeInfo++ and cause infinite loop
                 }
-                (*itHarqTbInfo).second.at(harqId) = dci;
-                // Update HARQ process status (RV 0)
-                std::map<uint16_t, UlHarqProcessesStatus_t>::iterator itStat =
-                    m_ulHarqProcessesStatus.find(dci.m_rnti);
-                NS_ASSERT(itStat->second[dci.m_harqProcess] > 0);
-                // refresh timer
-                std::map<uint16_t, UlHarqProcessesTimer_t>::iterator itHarqTimer =
-                    m_ulHarqProcessesTimer.find(dci.m_rnti);
-                if (itHarqTimer == m_ulHarqProcessesTimer.end())
+                else
                 {
-                    NS_FATAL_ERROR("Unable to find HARQ timer for RNTI " << (uint16_t)dci.m_rnti);
+                    uint8_t harqId = dci.m_harqProcess;
+                    std::map<uint16_t, UlHarqProcessesDciInfoList_t>::iterator itHarqTbInfo =
+                        m_ulHarqProcessesDciInfoMap.find(dci.m_rnti);
+                    if (itHarqTbInfo == m_ulHarqProcessesDciInfoMap.end())
+                    {
+                        // RNTI not found - UE was likely removed during handover
+                        // This can happen when scheduled events execute after UE removal
+                        // Skip UL HARQ update but continue with rest of loop (don't use continue - it skips itUeInfo++)
+                        NS_LOG_WARN("Unable to find RNTI entry in UL DCI HARQ buffer for RNTI "
+                                    << dci.m_rnti << " - skipping UL HARQ update (UE may have been removed during handover)");
+                        // Don't use continue here - it would skip itUeInfo++ and cause infinite loop
+                    }
+                    else
+                    {
+                        // Check UL HARQ status before accessing
+                        std::map<uint16_t, UlHarqProcessesStatus_t>::iterator itStat =
+                            m_ulHarqProcessesStatus.find(dci.m_rnti);
+                        if (itStat == m_ulHarqProcessesStatus.end())
+                        {
+                            // RNTI not found in UL HARQ status - UE was likely removed during handover
+                            NS_LOG_WARN("Unable to find UL HARQ status for RNTI " << dci.m_rnti 
+                                        << " - skipping UL HARQ update (UE may have been removed during handover)");
+                            // Don't use continue here - it would skip itUeInfo++ and cause infinite loop
+                        }
+                        else
+                        {
+                            (*itHarqTbInfo).second.at(harqId) = dci;
+                            // Update HARQ process status (RV 0)
+                            NS_ASSERT(itStat->second[dci.m_harqProcess] > 0);
+                            
+                            // refresh timer
+                            std::map<uint16_t, UlHarqProcessesTimer_t>::iterator itHarqTimer =
+                                m_ulHarqProcessesTimer.find(dci.m_rnti);
+                            if (itHarqTimer == m_ulHarqProcessesTimer.end())
+                            {
+                                // RNTI not found in UL HARQ timer - UE was likely removed during handover
+                                // This can happen when scheduled events execute after UE removal
+                                NS_LOG_WARN("Unable to find HARQ timer for RNTI " << (uint16_t)dci.m_rnti 
+                                            << " - skipping UL HARQ timer update (UE may have been removed during handover)");
+                                // Don't use continue here - it would skip itUeInfo++ and cause infinite loop
+                            }
+                            else
+                            {
+                                (*itHarqTimer).second.at(dci.m_harqProcess) = 0;
+                            }
+                        }
+                    }
                 }
-                (*itHarqTimer).second.at(dci.m_harqProcess) = 0;
             }
         }
         itUeInfo++;

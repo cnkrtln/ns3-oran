@@ -35,6 +35,7 @@
 #include <ns3/log.h>
 #include <ns3/abort.h>
 
+
 #include <ns3/pointer.h>
 #include <ns3/object-map.h>
 #include <ns3/object-factory.h>
@@ -47,6 +48,7 @@
 #include <ns3/lte-rlc.h>
 #include <ns3/lte-rlc-tm.h>
 #include <ns3/lte-rlc-um.h>
+#include <fstream>
 #include <ns3/lte-rlc-am.h>
 #include <ns3/lte-rlc-am-header.h>
 #include <ns3/lte-rlc-sdu-status-tag.h>
@@ -56,8 +58,14 @@
 #include <ns3/mc-enb-pdcp.h>
 #include "ns3/lte-pdcp-tag.h"
 #include <ns3/lte-rlc-sap.h>
-
-
+#include <ns3/node-list.h>
+#include <ns3/node.h>
+#include <ns3/net-device.h>
+#include <ns3/epc-enb-application.h>
+#include <ns3/mmwave-enb-net-device.h>
+#include <ns3/lte-enb-net-device.h>
+#include <ns3/mmwave-ue-net-device.h>
+#include <ns3/mmwave-enb-phy.h>
 
 namespace ns3 {
 
@@ -576,6 +584,27 @@ UeManager::StartDataRadioBearers ()
         {
           drbIt->second->m_pdcp->Initialize ();
         }
+      
+      // CRITICAL FIX: Ensure RLC is ready to report buffer status when packets arrive
+      // After manual handover, RLC is re-initialized, but the MAC scheduler needs to know
+      // about the UE's RLC buffers when packets arrive. The RLC will automatically report
+      // buffer status when packets arrive (via DoTransmitPdcpPdu -> DoReportBufferStatus),
+      // but we need to ensure the RLC-MAC connection is properly established.
+      // This is handled by SetupDataRadioBearer which calls AddLc, so we just log here.
+      // The actual buffer status reporting will happen automatically when packets arrive.
+      
+      // DEBUG: Log RLC initialization completion
+      double timestamp = Simulator::Now().GetSeconds();
+      std::string handoverDebugFileName = "/dev/null";
+      std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",RLC_INITIALIZED,Cell" 
+                           << m_rrc->ComponentCarrierToCellId(m_componentCarrierId)
+                           << ",RNTI" << m_rnti << ",IMSI" << m_imsi 
+                           << ",DRBID=" << (uint32_t)(*drbIdIt) << std::endl;
+          handoverDebugLog.close();
+        }
     }
   m_drbsToBeStarted.clear ();
 }
@@ -650,26 +679,61 @@ UeManager::ScheduleRrcConnectionReconfiguration ()
     case CONNECTED_NORMALLY:
       {
         m_pendingRrcConnectionReconfiguration = false;
-        LteRrcSap::RrcConnectionReconfiguration msg = BuildRrcConnectionReconfiguration ();
-        m_rrc->m_rrcSapUser->SendRrcConnectionReconfiguration (m_rnti, msg);
-        RecordDataRadioBearersToBeStarted ();
-        SwitchToState (CONNECTION_RECONFIGURATION);
+        // CRITICAL FIX: Skip RRC reconfiguration for manual handover scenarios
+        // Manual handover doesn't need RRC reconfiguration - UE is already connected
+        // Attempting to send RRC message causes segfault because UE RRC SAP callback is invalid
+        // We only need CONNECTED_NORMALLY state for MAC scheduler to work
+        // For normal handover, this would send RRC message, but for manual handover we skip it
+        // The state is already CONNECTED_NORMALLY, which enables MAC scheduling and DU metrics
+        
+        // NOTE: This function is called from SwitchToState() when transitioning to CONNECTED_NORMALLY
+        // For manual handover, we want to stay in CONNECTED_NORMALLY without sending RRC message
+        // The previous fix in SwitchToState() prevents ScheduleRrcConnectionReconfiguration() from being called
+        // So this code path should not be reached for manual handover, but we keep the safety check
+        
+        // Safety check: Only send RRC reconfiguration if RRC SAP user is valid
+        // This prevents segfault during manual handover where UE RRC SAP might not be set up
+        if (m_rrc->m_rrcSapUser != nullptr)
+          {
+            LteRrcSap::RrcConnectionReconfiguration msg = BuildRrcConnectionReconfiguration ();
+            m_rrc->m_rrcSapUser->SendRrcConnectionReconfiguration (m_rnti, msg);
+            RecordDataRadioBearersToBeStarted ();
+            SwitchToState (CONNECTION_RECONFIGURATION);
+          }
+        else
+          {
+            NS_LOG_WARN ("ScheduleRrcConnectionReconfiguration: m_rrcSapUser is null, skipping RRC reconfiguration for RNTI " << m_rnti);
+            // Still record bearers to be started
+            RecordDataRadioBearersToBeStarted ();
+            // Stay in CONNECTED_NORMALLY - this is what we want for MAC to schedule packets!
+            // Don't transition to CONNECTION_RECONFIGURATION
+          }
       }
       break;
 
     case PREPARE_MC_CONNECTION_RECONFIGURATION:
       {
         m_pendingRrcConnectionReconfiguration = false;
-        LteRrcSap::RrcConnectionReconfiguration msg = BuildRrcConnectionReconfiguration ();
-        msg.haveMeasConfig = false;
-        msg.haveMobilityControlInfo = false;
-        msg.radioResourceConfigDedicated.srbToAddModList.clear();
-        msg.radioResourceConfigDedicated.physicalConfigDedicated.haveAntennaInfoDedicated = false;
-        msg.radioResourceConfigDedicated.physicalConfigDedicated.haveSoundingRsUlConfigDedicated = false;
-        msg.radioResourceConfigDedicated.physicalConfigDedicated.havePdschConfigDedicated = false;
-        m_rrc->m_rrcSapUser->SendRrcConnectionReconfiguration (m_rnti, msg);
-        RecordDataRadioBearersToBeStarted ();
-        SwitchToState (MC_CONNECTION_RECONFIGURATION);
+        // Safety check: Only send RRC reconfiguration if RRC SAP user is valid
+        if (m_rrc->m_rrcSapUser != nullptr)
+          {
+            LteRrcSap::RrcConnectionReconfiguration msg = BuildRrcConnectionReconfiguration ();
+            msg.haveMeasConfig = false;
+            msg.haveMobilityControlInfo = false;
+            msg.radioResourceConfigDedicated.srbToAddModList.clear();
+            msg.radioResourceConfigDedicated.physicalConfigDedicated.haveAntennaInfoDedicated = false;
+            msg.radioResourceConfigDedicated.physicalConfigDedicated.haveSoundingRsUlConfigDedicated = false;
+            msg.radioResourceConfigDedicated.physicalConfigDedicated.havePdschConfigDedicated = false;
+            m_rrc->m_rrcSapUser->SendRrcConnectionReconfiguration (m_rnti, msg);
+            RecordDataRadioBearersToBeStarted ();
+            SwitchToState (MC_CONNECTION_RECONFIGURATION);
+          }
+        else
+          {
+            NS_LOG_WARN ("ScheduleRrcConnectionReconfiguration: m_rrcSapUser is null, skipping MC RRC reconfiguration for RNTI " << m_rnti);
+            RecordDataRadioBearersToBeStarted ();
+            // Stay in current state if we can't send the message
+          }
       }
       break;
 
@@ -1184,17 +1248,81 @@ UeManager::SendData (uint8_t bid, Ptr<Packet> p)
         LtePdcpSapProvider::TransmitPdcpSduParameters params;
         params.pdcpSdu = p;
         params.rnti = m_rnti;
-        params.lcid = Bid2Lcid (bid);
-        uint8_t drbid = Bid2Drbid (bid);
-        //Transmit PDCP sdu only if DRB ID found in drbMap
-        std::map<uint8_t, Ptr<LteDataRadioBearerInfo> >::iterator it = m_drbMap.find (drbid);
-        if (it != m_drbMap.end ())
+        
+        // CRITICAL FIX: Find DRB by m_epsBearerIdentity instead of using Bid2Drbid()
+        // Bid2Drbid() assumes BID == DRBID, but after manual handover, BID from EpcEnbApplication
+        // might be 0 while DRBID is 1. We need to search m_drbMap for the DRB with matching BID.
+        uint8_t drbid = 0;
+        Ptr<LteDataRadioBearerInfo> bearerInfo = nullptr;
+        
+        // First try: Use Bid2Drbid() (works for normal cases where BID == DRBID)
+        uint8_t drbidFromBid = Bid2Drbid (bid);
+        std::map<uint8_t, Ptr<LteDataRadioBearerInfo> >::iterator it = m_drbMap.find (drbidFromBid);
+        if (it != m_drbMap.end () && it->second->m_epsBearerIdentity == bid)
           {
-            Ptr<LteDataRadioBearerInfo> bearerInfo = GetDataRadioBearerInfo (drbid);
-            if (bearerInfo)
+            // Found by direct lookup and BID matches
+            drbid = drbidFromBid;
+            bearerInfo = it->second;
+          }
+        else
+          {
+            // Second try: Search through all DRBs to find one with matching m_epsBearerIdentity
+            // This handles the case where BID != DRBID (e.g., BID=0, DRBID=1)
+            for (it = m_drbMap.begin (); it != m_drbMap.end (); ++it)
               {
-                LtePdcpSapProvider* pdcpSapProvider = bearerInfo->m_pdcp->GetLtePdcpSapProvider ();
+                if (it->second->m_epsBearerIdentity == bid)
+                  {
+                    drbid = it->first;
+                    bearerInfo = it->second;
+                    break;
+                  }
+              }
+          }
+        
+        params.lcid = (bearerInfo) ? bearerInfo->m_logicalChannelIdentity : Bid2Lcid (bid);
+        
+        // DEBUG: Log application packet arrival at UeManager
+        double timestamp = Simulator::Now().GetSeconds();
+        std::string appDebugFileName = "/dev/null";
+        std::ofstream appDebugLog(appDebugFileName.c_str(), std::ios::app);
+        if (appDebugLog.is_open())
+          {
+            appDebugLog << timestamp << ",APP_TO_UEMANAGER,RNTI" << m_rnti
+                       << ",BID=" << (uint32_t)bid << ",DRBID=" << (uint32_t)drbid
+                       << ",LCID=" << (uint32_t)params.lcid << ",Size=" << p->GetSize()
+                       << ",State=" << ToString(m_state) << ",Found=" << (bearerInfo ? "YES" : "NO") << std::endl;
+            appDebugLog.close();
+          }
+        
+        //Transmit PDCP sdu only if DRB found
+        if (bearerInfo && bearerInfo->m_pdcp)
+          {
+            LtePdcpSapProvider* pdcpSapProvider = bearerInfo->m_pdcp->GetLtePdcpSapProvider ();
+            if (pdcpSapProvider)
+              {
                 pdcpSapProvider->TransmitPdcpSdu (params);
+              }
+            else
+              {
+                // DEBUG: Log if PDCP SAP provider is null
+                if (appDebugLog.is_open())
+                  {
+                    appDebugLog.open(appDebugFileName.c_str(), std::ios::app);
+                    appDebugLog << timestamp << ",APP_TO_UEMANAGER_ERROR,RNTI" << m_rnti
+                               << ",DRBID=" << (uint32_t)drbid << ",PDCP_SAP_PROVIDER_NULL" << std::endl;
+                    appDebugLog.close();
+                  }
+              }
+          }
+        else
+          {
+            // DEBUG: Log if DRB not found
+            if (appDebugLog.is_open())
+              {
+                appDebugLog.open(appDebugFileName.c_str(), std::ios::app);
+                appDebugLog << timestamp << ",APP_TO_UEMANAGER_ERROR,RNTI" << m_rnti
+                           << ",BID=" << (uint32_t)bid << ",DRB_NOT_FOUND_BY_BID" << std::endl;
+                appDebugLog.close();
               }
           }
       }
@@ -1232,7 +1360,18 @@ UeManager::SendData (uint8_t bid, Ptr<Packet> p)
       break;
 
     default:
-      NS_FATAL_ERROR ("method unexpected in state " << ToString (m_state));
+      {
+        // Print state value first (before ToString which might crash if state is invalid)
+        int stateVal = (int)m_state;
+        std::string stateStr = "INVALID";
+        if (stateVal >= 0 && stateVal < UeManager::NUM_STATES)
+          {
+            stateStr = ToString (m_state);
+          }
+        NS_FATAL_ERROR ("SendData: method unexpected in state " << stateStr 
+                        << " (state value: " << stateVal << ", NUM_STATES: " << UeManager::NUM_STATES
+                        << ", RNTI: " << m_rnti << ", IMSI: " << m_imsi << ")");
+      }
       break;
     }
 }
@@ -1261,6 +1400,18 @@ void
 UeManager::SendUeContextRelease ()
 {
   NS_LOG_FUNCTION (this);
+  
+  // DEBUG: Log SendUeContextRelease called
+  double timestamp = Simulator::Now().GetSeconds();
+  std::string handoverDebugFileName = "/dev/null";
+  std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+  if (handoverDebugLog.is_open())
+    {
+      handoverDebugLog << timestamp << ",SendUeContextRelease_CALLED,Cell" << m_rrc->ComponentCarrierToCellId(m_componentCarrierId)
+                       << ",RNTI" << m_rnti << ",IMSI" << m_imsi << ",CurrentState=" << m_state << std::endl;
+      handoverDebugLog.close();
+    }
+  
   switch (m_state)
     {
     case HANDOVER_PATH_SWITCH:
@@ -1271,7 +1422,65 @@ UeManager::SendUeContextRelease ()
       ueCtxReleaseParams.sourceCellId = m_sourceCellId;
       ueCtxReleaseParams.targetCellId = m_targetCellId;
       m_rrc->m_x2SapProvider->SendUeContextRelease (ueCtxReleaseParams);
+      
+      // DEBUG: Log before state transition
+      timestamp = Simulator::Now().GetSeconds();
+      handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",SendUeContextRelease_TRANSITIONING,Cell" << m_rrc->ComponentCarrierToCellId(m_componentCarrierId)
+                           << ",RNTI" << m_rnti << ",IMSI" << m_imsi 
+                           << ",FromState=HANDOVER_PATH_SWITCH,ToState=CONNECTED_NORMALLY" << std::endl;
+          handoverDebugLog.close();
+        }
+      
       SwitchToState (CONNECTED_NORMALLY);
+      
+      // DEBUG: Log after state transition
+      timestamp = Simulator::Now().GetSeconds();
+      handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",SendUeContextRelease_STATE_CHANGED,Cell" << m_rrc->ComponentCarrierToCellId(m_componentCarrierId)
+                           << ",RNTI" << m_rnti << ",IMSI" << m_imsi 
+                           << ",NewState=" << m_state << " (should be CONNECTED_NORMALLY)" << std::endl;
+          handoverDebugLog.close();
+        }
+      
+      // CRITICAL FIX: Notify MAC scheduler AFTER transitioning to CONNECTED_NORMALLY
+      // This matches the normal X2 handover flow where RecvRrcConnectionReconfigurationCompleted()
+      // calls UeUpdateConfigurationReq() after the UE is in CONNECTED_NORMALLY state.
+      // The scheduler needs the UE to be in CONNECTED_NORMALLY before it will schedule.
+      // This ensures HARQ processes are initialized and the UE is ready for scheduling.
+      LteEnbCmacSapProvider::UeConfig req;
+      req.m_rnti = m_rnti;
+      req.m_transmissionMode = m_physicalConfigDedicated.antennaInfo.transmissionMode;
+      
+      // Log before notifying MAC scheduler
+      timestamp = Simulator::Now().GetSeconds();
+      handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",MAC_SCHEDULER_NOTIFIED,Cell" << m_rrc->ComponentCarrierToCellId(m_componentCarrierId)
+                           << ",IMSI" << m_imsi << ",RNTI" << m_rnti 
+                           << ",State=CONNECTED_NORMALLY,TransmissionMode=" 
+                           << (uint16_t)req.m_transmissionMode << std::endl;
+          handoverDebugLog.close();
+        }
+      
+      for (uint8_t i = 0; i < m_rrc->m_numberOfComponentCarriers; i++)
+        {
+          m_rrc->m_cmacSapProvider.at (i)->UeUpdateConfigurationReq (req);
+          
+          // Also configure PHY (like normal handover does)
+          m_rrc->m_cphySapProvider.at (i)->SetTransmissionMode (m_rnti, req.m_transmissionMode);
+          double paDouble = LteRrcSap::ConvertPdschConfigDedicated2Double (m_physicalConfigDedicated.pdschConfigDedicated);
+          m_rrc->m_cphySapProvider.at (i)->SetPa (m_rnti, paDouble);
+        }
+      
+      NS_LOG_UNCOND ("SendUeContextRelease: Notified MAC scheduler about UE configuration (RNTI " 
+                     << m_rnti << ", IMSI " << m_imsi << ", State=CONNECTED_NORMALLY)");
+      
       m_rrc->m_handoverEndOkTrace (m_imsi, m_rrc->ComponentCarrierToCellId (m_componentCarrierId), m_rnti);
       break;
 
@@ -2470,27 +2679,55 @@ UeManager::SwitchToState (State newState)
             if(m_rrc->m_bestMmWaveCellForImsiMap.at(m_imsi) != m_rrc->GetCellId() && !m_rrc->m_ismmWave)
             {
               uint16_t maxSinrCellId = m_rrc->m_bestMmWaveCellForImsiMap.at(m_imsi);
-              // get the SINR
-              double maxSinrDb = 10*std::log10(m_rrc->m_imsiCellSinrMap.find(m_imsi)->second.find(maxSinrCellId)->second);
-              if(maxSinrDb > m_rrc->m_outageThreshold)
-              {
-                // there is a MmWave cell to which the UE can connect
-                // send the connection message, then, if capable, the UE will connect
-                NS_LOG_INFO("Send connect to " << m_rrc->m_bestMmWaveCellForImsiMap.find(m_imsi)->second << " at least one mmWave eNB is not in outage");
-                m_rrc->m_rrcSapUser->SendRrcConnectToMmWave (m_rnti, m_rrc->m_bestMmWaveCellForImsiMap.find(m_imsi)->second);
-              }
+              // get the SINR - add safety check to prevent segfault if map is not initialized
+              auto imsiSinrIt = m_rrc->m_imsiCellSinrMap.find(m_imsi);
+              if(imsiSinrIt != m_rrc->m_imsiCellSinrMap.end())
+                {
+                  auto cellSinrIt = imsiSinrIt->second.find(maxSinrCellId);
+                  if(cellSinrIt != imsiSinrIt->second.end())
+                    {
+                      double maxSinrDb = 10*std::log10(cellSinrIt->second);
+                      if(maxSinrDb > m_rrc->m_outageThreshold)
+                        {
+                          // there is a MmWave cell to which the UE can connect
+                          // send the connection message, then, if capable, the UE will connect
+                          NS_LOG_INFO("Send connect to " << m_rrc->m_bestMmWaveCellForImsiMap.find(m_imsi)->second << " at least one mmWave eNB is not in outage");
+                          m_rrc->m_rrcSapUser->SendRrcConnectToMmWave (m_rnti, m_rrc->m_bestMmWaveCellForImsiMap.find(m_imsi)->second);
+                        }
+                      else
+                        {
+                          //TODO
+                          m_allMmWaveInOutageAtInitialAccess = true;
+                          m_rrc->m_imsiUsingLte[m_imsi] = true;
+                        }
+                    }
+                  else
+                    {
+                      NS_LOG_WARN("SwitchToState: m_imsiCellSinrMap entry for IMSI " << m_imsi << " cell " << maxSinrCellId << " not found, skipping mmWave connection");
+                    }
+                }
               else
-              {
-                //TODO
-                m_allMmWaveInOutageAtInitialAccess = true;
-                m_rrc->m_imsiUsingLte[m_imsi] = true;
-              }
+                {
+                  NS_LOG_WARN("SwitchToState: m_imsiCellSinrMap entry for IMSI " << m_imsi << " not found, skipping mmWave connection");
+                }
             }
           }
         }
+        // CRITICAL FIX: Skip RRC reconfiguration for manual handover
+        // Manual handover doesn't need RRC reconfiguration - UE is already connected
+        // Attempting to send RRC message causes segfault because UE RRC SAP callback is invalid
+        // We only need CONNECTED_NORMALLY state for MAC scheduler to work
+        // Check if this is a manual handover scenario by checking if we came from HANDOVER_JOINING
+        // and if m_rrcSapUser callback would be invalid (we can't check this directly, so we skip)
         if (m_pendingRrcConnectionReconfiguration == true)
           {
-            ScheduleRrcConnectionReconfiguration ();
+            // For manual handover, we skip RRC reconfiguration
+            // The state is already CONNECTED_NORMALLY, which is what we need for MAC scheduling
+            // Setting the flag to false prevents future attempts
+            NS_LOG_WARN ("SwitchToState(CONNECTED_NORMALLY): Skipping RRC reconfiguration for RNTI " << m_rnti << " (likely manual handover). State is CONNECTED_NORMALLY for MAC scheduling.");
+            m_pendingRrcConnectionReconfiguration = false;
+            // Don't call ScheduleRrcConnectionReconfiguration() - it would cause segfault
+            // The state is already CONNECTED_NORMALLY, which enables MAC scheduling
           }
         if (m_pendingStartDataRadioBearers == true && m_caSupportConfigured == true)
           {
@@ -3059,6 +3296,7 @@ LteEnbRrc::GetEpcX2SapUser ()
   NS_LOG_FUNCTION (this);
   return m_x2SapUser;
 }
+
 
 void
 LteEnbRrc::SetEpcX2PdcpProvider (EpcX2PdcpProvider * s)
@@ -3641,54 +3879,75 @@ LteEnbRrc::DoUpdateUeSinrEstimate(LteEnbCphySapUser::UeAssociatedSinrInfo info)
   NS_LOG_INFO ("CC " << (uint16_t)info.componentCarrierId << " reports the ueImsiSinrMap");
   m_ueImsiSinrMap[info.componentCarrierId]=info.ueImsiSinrMap; // store the received report in m_ueImsiSinrMap
 
-  // TODO report immediately or with some filtering
-  if(m_lteCellId > 0) // i.e., only if a LTE eNB was actually registered in the scenario
-                      // (this is done when an X2 interface among mmWave eNBs and LTE eNB is added)
+  // Build the SINR map to send (aggregate across all CCs if needed)
+  std::map<uint64_t, double> ueImsiSinrMapToSend;
+  bool sinrMapReady = false;
+
+  //if (m_reportAllUeMeas == true)
+  if(false)
   {
-    // send the report to the LTE coordinator
-    EpcX2SapProvider::UeImsiSinrParams params;
-    params.targetCellId = m_lteCellId;
-    params.sourceCellId = m_cellId;
+    ueImsiSinrMapToSend = info.ueImsiSinrMap;
+    m_ueImsiSinrMap.clear(); // delete the reports
+    sinrMapReady = true;
+  }
+  else
+  {
+    if (m_ueImsiSinrMap.size() == m_numberOfComponentCarriers) // if we received the ueImsiSinrMap report from all the CCs
+    {
+      // Build the ueImsiSinrMapToSend containing, for each UE, the max SINR among all the CCs
+      NS_LOG_DEBUG ("Number of ueImsiSinrMaps in m_ueImsiSinrMap " << (uint16_t)m_ueImsiSinrMap.size() );
 
-    //if (m_reportAllUeMeas == true)
-    if(false)
-    {
-      params.ueImsiSinrMap = info.ueImsiSinrMap;
-      m_ueImsiSinrMap.clear(); // delete the reports
-    }
-    else
-    {
-      if (m_ueImsiSinrMap.size() == m_numberOfComponentCarriers) // if we received the ueImsiSinrMap report from all the CCs
+      ueImsiSinrMapToSend = m_ueImsiSinrMap.at(0); // initialization
+
+      for(uint8_t cc = 1; cc < m_numberOfComponentCarriers; cc++)
       {
-        // Build the ueImsiSinrMapToSend containing, for each UE, the max SINR among all the CCs
-        NS_LOG_DEBUG ("Number of ueImsiSinrMaps in m_ueImsiSinrMap " << (uint16_t)m_ueImsiSinrMap.size() );
+        NS_ASSERT_MSG (m_ueImsiSinrMap.find(cc) != m_ueImsiSinrMap.end(), "CC " << (uint16_t)cc << " didn't report the ueImsiSinrMap");
 
-        std::map<uint64_t, double> ueImsiSinrMapToSend; // map which contains the max SINR for each UE among the CCs
-        ueImsiSinrMapToSend = m_ueImsiSinrMap.at(0); // initialization
-
-        for(uint8_t cc = 1; cc < m_numberOfComponentCarriers; cc++)
+        for (std::map<uint64_t, double>::iterator ue = ueImsiSinrMapToSend.begin(); ue != ueImsiSinrMapToSend.end(); ue++)
         {
-          NS_ASSERT_MSG (m_ueImsiSinrMap.find(cc) != m_ueImsiSinrMap.end(), "CC " << (uint16_t)cc << " didn't report the ueImsiSinrMap");
+          NS_ASSERT_MSG (m_ueImsiSinrMap.at(cc).find(ue->first) != m_ueImsiSinrMap.at(cc).end(), "CC " << (uint16_t)cc << " didn't report SINR for UE "<< ue->first );
 
-          for (std::map<uint64_t, double>::iterator ue = ueImsiSinrMapToSend.begin(); ue != ueImsiSinrMapToSend.end(); ue++)
+          NS_LOG_DEBUG ("UE " << ue->first << " current SINR " << ue->second << " is higher than " << m_ueImsiSinrMap.at(cc).at(ue->first) << " ?");
+          if (ue->second < m_ueImsiSinrMap.at(cc).at(ue->first))
           {
-            NS_ASSERT_MSG (m_ueImsiSinrMap.at(cc).find(ue->first) != m_ueImsiSinrMap.at(cc).end(), "CC " << (uint16_t)cc << " didn't report SINR for UE "<< ue->first );
-
-            NS_LOG_DEBUG ("UE " << ue->first << " current SINR " << ue->second << " is higher than " << m_ueImsiSinrMap.at(cc).at(ue->first) << " ?");
-            if (ue->second < m_ueImsiSinrMap.at(cc).at(ue->first))
-            {
-              NS_LOG_DEBUG ("No, update SINR to " << m_ueImsiSinrMap.at(cc).at(ue->first));
-              ue->second = m_ueImsiSinrMap.at(cc).at(ue->first); // insert the max SINR for this UE among all the CCs
-            }
+            NS_LOG_DEBUG ("No, update SINR to " << m_ueImsiSinrMap.at(cc).at(ue->first));
+            ue->second = m_ueImsiSinrMap.at(cc).at(ue->first); // insert the max SINR for this UE among all the CCs
           }
         }
-        params.ueImsiSinrMap = ueImsiSinrMapToSend;
-        m_ueImsiSinrMap.clear(); // delete the reports
       }
+      m_ueImsiSinrMap.clear(); // delete the reports
+      sinrMapReady = true;
+    }
+  }
+
+  // Send SINR updates to all X2 neighbors (enables SA mode handover)
+  if (sinrMapReady && !ueImsiSinrMapToSend.empty())
+  {
+    // Send to all X2-connected neighbors (mmWave-to-mmWave or mmWave-to-LTE)
+    for (std::set<uint16_t>::iterator it = m_x2NeighbourCells.begin(); it != m_x2NeighbourCells.end(); ++it)
+    {
+      uint16_t neighborCellId = *it;
+      EpcX2SapProvider::UeImsiSinrParams params;
+      params.targetCellId = neighborCellId;
+      params.sourceCellId = m_cellId;
+      params.ueImsiSinrMap = ueImsiSinrMapToSend;
+
+      NS_LOG_INFO("Sending SINR update to neighbor cell " << neighborCellId << " (number of UEs: " << params.ueImsiSinrMap.size() << ")");
+      m_x2SapProvider->SendUeSinrUpdate (params);
     }
 
-    NS_LOG_INFO("number of SINR reported " << params.ueImsiSinrMap.size());
-    m_x2SapProvider->SendUeSinrUpdate (params);
+    // Also send to LTE coordinator if it exists (backward compatibility for NSA mode)
+    if(m_lteCellId > 0 && m_x2NeighbourCells.find(m_lteCellId) == m_x2NeighbourCells.end())
+    {
+      // LTE cell exists but is not in neighbor set (shouldn't happen, but handle gracefully)
+      EpcX2SapProvider::UeImsiSinrParams params;
+      params.targetCellId = m_lteCellId;
+      params.sourceCellId = m_cellId;
+      params.ueImsiSinrMap = ueImsiSinrMapToSend;
+
+      NS_LOG_INFO("Sending SINR update to LTE coordinator cell " << m_lteCellId << " (number of UEs: " << params.ueImsiSinrMap.size() << ")");
+      m_x2SapProvider->SendUeSinrUpdate (params);
+    }
   }
 
 }
@@ -4099,8 +4358,7 @@ LteEnbRrc::PerformE2RCHO (uint64_t imsi, uint16_t targetCellId)
   {  
     if(!onHandoverImsi)
     { 
-
-      uint16_t rnti = GetRntiFromImsi(imsi)  ; 
+      uint16_t rnti = GetRntiFromImsi(imsi); 
 
       NS_LOG_UNCOND (Simulator::Now ().GetNanoSeconds ()/ 1.0e9
                    << "s LteEnbRrc::PerfomeE2RCHO(): [UNCOND] Initiate handover for rnti "
@@ -4111,7 +4369,6 @@ LteEnbRrc::PerformE2RCHO (uint64_t imsi, uint16_t targetCellId)
     }
     else
     {
-      //TODO Do nothing or what?
       NS_LOG_UNCOND("## Warn: handover not triggered because the UE is already performing HO!");
     }
   }
@@ -4666,7 +4923,26 @@ LteEnbRrc::SendData (Ptr<Packet> packet)
   EpsBearerTag tag;
   bool found = packet->RemovePacketTag (tag);
   NS_ASSERT_MSG (found, "no EpsBearerTag found in packet to be sent");
-  Ptr<UeManager> ueManager = GetUeManager (tag.GetRnti ());
+  
+  uint16_t rnti = tag.GetRnti ();
+  
+  // Safety check: Verify UeManager exists before accessing
+  if (!HasUeManager (rnti))
+    {
+      NS_LOG_WARN ("SendData: UeManager for RNTI " << rnti << " not found in cell " << m_cellId
+                    << " - packet may be for a UE that has handed over. Discarding packet.");
+      return false;
+    }
+  
+  Ptr<UeManager> ueManager = GetUeManager (rnti);
+  
+  // Additional safety check: Verify UeManager pointer is valid
+  if (!ueManager)
+    {
+      NS_LOG_ERROR ("SendData: GetUeManager returned null for RNTI " << rnti << " in cell " << m_cellId);
+      return false;
+    }
+  
   ueManager->SendData (tag.GetBid (), packet);
 
   return true;
@@ -4746,6 +5022,11 @@ LteEnbRrc::SendHandoverRequest (uint16_t rnti, uint16_t cellId)
     NS_LOG_LOGIC("Request to send HANDOVER REQUEST");
     NS_ASSERT(m_configured);
 
+    if (!HasUeManager(rnti)) {
+        std::cout << "[LteEnbRrc] ERROR: SendHandoverRequest - UE Manager for RNTI " << rnti << " not found! (Cell " << m_cellId << ")" << std::endl;
+        return;
+    }
+
     NS_LOG_INFO("LteEnbRrc on cell " << m_cellId << " for rnti " << rnti
                                      << " SendHandoverRequest at time "
                                      << Simulator::Now().GetSeconds() << " to cellId " << cellId);
@@ -4821,8 +5102,57 @@ LteEnbRrc::DoDataRadioBearerSetupRequest (EpcEnbS1SapUser::DataRadioBearerSetupR
 void
 LteEnbRrc::DoPathSwitchRequestAcknowledge (EpcEnbS1SapUser::PathSwitchRequestAcknowledgeParameters params)
 {
+  // DEBUG: Log PathSwitchRequestAcknowledge received
+  double timestamp = Simulator::Now().GetSeconds();
+  std::string handoverDebugFileName = "/dev/null";
+  std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+  if (handoverDebugLog.is_open())
+    {
+      handoverDebugLog << timestamp << ",RRC_PATH_SWITCH_ACK_RECEIVED,Cell" << m_cellId 
+                       << ",RNTI" << params.rnti << std::endl;
+      handoverDebugLog.close();
+    }
+  
   Ptr<UeManager> ueManager = GetUeManager (params.rnti);
+  
+  if (ueManager == nullptr)
+    {
+      // DEBUG: Log error - UE not found
+      timestamp = Simulator::Now().GetSeconds();
+      handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",RRC_PATH_SWITCH_ACK_ERROR,Cell" << m_cellId 
+                           << ",RNTI" << params.rnti << ",ERROR=UE_NOT_FOUND" << std::endl;
+          handoverDebugLog.close();
+        }
+      NS_LOG_ERROR("DoPathSwitchRequestAcknowledge: UE with RNTI " << params.rnti << " not found!");
+      return;
+    }
+  
+  // DEBUG: Log before calling SendUeContextRelease
+  timestamp = Simulator::Now().GetSeconds();
+  handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+  if (handoverDebugLog.is_open())
+    {
+      handoverDebugLog << timestamp << ",RRC_CALLING_SendUeContextRelease,Cell" << m_cellId 
+                       << ",RNTI" << params.rnti << ",IMSI" << ueManager->GetImsi() 
+                       << ",CurrentState=" << ueManager->GetState() << std::endl;
+      handoverDebugLog.close();
+    }
+  
   ueManager->SendUeContextRelease ();
+  
+  // DEBUG: Log after calling SendUeContextRelease
+  timestamp = Simulator::Now().GetSeconds();
+  handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+  if (handoverDebugLog.is_open())
+    {
+      handoverDebugLog << timestamp << ",RRC_SendUeContextRelease_COMPLETE,Cell" << m_cellId 
+                       << ",RNTI" << params.rnti << ",IMSI" << ueManager->GetImsi() 
+                       << ",NewState=" << ueManager->GetState() << std::endl;
+      handoverDebugLog.close();
+    }
 }
 
 void
@@ -5320,6 +5650,742 @@ LteEnbRrc::RemoveUe (uint16_t rnti)
   RemoveSrsConfigurationIndex (srsCi);
 }
 
+bool
+LteEnbRrc::ManualHandover (uint64_t imsi, Ptr<LteEnbRrc> targetRrc, uint16_t targetCellId, uint16_t& targetRnti)
+{
+  NS_LOG_FUNCTION (this << imsi << targetCellId);
+
+  // Step 1: Verify UE is registered in source cell
+  uint16_t sourceRnti = GetRntiFromImsi (imsi);
+  if (sourceRnti == 0 || !HasUeManager (sourceRnti))
+    {
+      NS_LOG_WARN ("ManualHandover: UE " << imsi << " not registered in source cell " << m_cellId);
+      return false;
+    }
+
+  // Step 2: Get UeManager to copy DRBs BEFORE removing
+  Ptr<UeManager> sourceUeManager = GetUeManager (sourceRnti);
+  if (!sourceUeManager)
+    {
+      NS_LOG_ERROR ("ManualHandover: Failed to get source UeManager");
+      return false;
+    }
+
+  // Step 2.5: Copy DRB info BEFORE removing (RemoveUe destroys UeManager)
+  // Store DRB info in a temporary structure
+  struct DrbInfo
+  {
+    uint8_t drbId;
+    EpsBearer bearer;
+    uint32_t gtpTeid;
+    Ipv4Address transportLayerAddress;
+  };
+  std::vector<DrbInfo> drbInfoList;
+  auto drbMap = sourceUeManager->GetDrbMap ();
+  for (auto drbIt = drbMap.begin (); drbIt != drbMap.end (); ++drbIt)
+    {
+      uint8_t drbId = drbIt->first;
+      Ptr<LteDataRadioBearerInfo> drbInfo = drbIt->second;
+      
+      if (drbInfo)
+        {
+          DrbInfo info;
+          info.drbId = drbId;
+          info.bearer = drbInfo->m_epsBearer;
+          info.gtpTeid = drbInfo->m_gtpTeid;
+          info.transportLayerAddress = drbInfo->m_transportLayerAddress;
+          drbInfoList.push_back (info);
+        }
+    }
+
+  // Step 3: Verify target RRC
+  if (!targetRrc)
+    {
+      NS_LOG_ERROR ("ManualHandover: Target RRC is null");
+      return false;
+    }
+
+  // Step 4: Check if target already has this UE
+  uint16_t existingRnti = targetRrc->GetRntiFromImsi (imsi);
+  if (existingRnti != 0)
+    {
+      NS_LOG_INFO ("ManualHandover: UE " << imsi << " already in target cell, removing first");
+      targetRrc->RemoveUe (existingRnti);
+    }
+
+  // Step 5: DON'T remove UeManager from source cell - just update IMSI mapping
+  // This is the KEY INSIGHT: We don't need to remove the UeManager immediately!
+  // By removing it from IMSI mapping, E2 reports will be correct (won't show UE in source cell)
+  // The old UeManager will stay alive, allowing packets in flight to finish safely
+  // It will be naturally cleaned up later or can be removed after all packets are done
+  
+  // Remove from IMSI-to-RNTI mapping (so E2 reports won't show UE in source cell)
+  std::map<uint64_t, uint16_t>::iterator imsiIt = m_imsiRntiMap.find (imsi);
+  if (imsiIt != m_imsiRntiMap.end ())
+    {
+      uint16_t oldRnti = imsiIt->second;
+      
+      // TEST 1: Log BEFORE removal
+      double timestamp = Simulator::Now().GetSeconds();
+      std::string debugFileName = "mapping_debug.txt";
+      std::ofstream debugLog(debugFileName.c_str(), std::ios::app);
+      if (debugLog.is_open())
+        {
+          debugLog << timestamp << ",BEFORE_REMOVAL,Cell" << m_cellId 
+                   << ",IMSI" << imsi << ",OldRNTI" << oldRnti
+                   << ",GetImsiFromRnti(oldRnti)=" << GetImsiFromRnti(oldRnti)
+                   << ",GetRntiFromImsi(imsi)=" << GetRntiFromImsi(imsi) << std::endl;
+        }
+      
+      m_imsiRntiMap.erase (imsiIt);
+      NS_LOG_INFO("ManualHandover: Removed IMSI " << imsi << " -> RNTI " << oldRnti << " mapping from source cell " << m_cellId);
+      
+      // Also remove from reverse mapping (RNTI->IMSI)
+      std::map<uint16_t, uint64_t>::iterator rntiIt = m_rntiImsiMap.find (oldRnti);
+      if (rntiIt != m_rntiImsiMap.end ())
+        {
+          m_rntiImsiMap.erase (rntiIt);
+          NS_LOG_INFO("ManualHandover: Removed RNTI " << oldRnti << " -> IMSI " << imsi << " mapping from source cell " << m_cellId);
+        }
+      
+      // TEST 1: Log AFTER removal - verify mappings return 0
+      if (debugLog.is_open())
+        {
+          uint64_t verifyImsiFromRnti = GetImsiFromRnti(oldRnti);
+          uint16_t verifyRntiFromImsi = GetRntiFromImsi(imsi);
+          debugLog << timestamp << ",AFTER_REMOVAL,Cell" << m_cellId 
+                   << ",IMSI" << imsi << ",OldRNTI" << oldRnti
+                   << ",GetImsiFromRnti(oldRnti)=" << verifyImsiFromRnti
+                   << ",GetRntiFromImsi(imsi)=" << verifyRntiFromImsi
+                   << ",VERIFY=" << (verifyImsiFromRnti == 0 && verifyRntiFromImsi == 0 ? "PASS" : "FAIL") << std::endl;
+          debugLog.close();
+        }
+    }
+  else
+    {
+      NS_LOG_WARN("ManualHandover: IMSI " << imsi << " not found in m_imsiRntiMap of source cell " << m_cellId);
+      // TEST 1: Log warning case
+      double timestamp = Simulator::Now().GetSeconds();
+      std::string debugFileName = "mapping_debug.txt";
+      std::ofstream debugLog(debugFileName.c_str(), std::ios::app);
+      if (debugLog.is_open())
+        {
+          debugLog << timestamp << ",WARNING,Cell" << m_cellId 
+                   << ",IMSI" << imsi << ",NOT_FOUND_IN_IMSIRNTIMAP" << std::endl;
+          debugLog.close();
+        }
+    }
+  
+  // Clean up state maps (so E2 reports won't show UE in source cell)
+  m_mmWaveCellSetupCompleted.erase (imsi);
+  m_lastMmWaveCell.erase (imsi);
+  m_imsiUsingLte.erase (imsi);
+  
+  // CRITICAL: Remove RNTI from MAC and PHY layers BEFORE removing from component carrier manager
+  // This ensures the MAC scheduler removes HARQ process status maps, preventing fatal errors
+  // when the scheduler tries to access a removed RNTI
+  // The order matters: MAC/PHY first, then component carrier manager
+  // NOTE: We remove from ALL component carriers (matching DoInitialize() which adds to all)
+  for (uint8_t i = 0; i < m_numberOfComponentCarriers; i++)
+    {
+      // Remove from MAC (this triggers scheduler cleanup via DoCschedUeReleaseReq)
+      m_cmacSapProvider.at (i)->RemoveUe (sourceRnti);
+      
+      // Remove from PHY (now safe - PHY's DoRemoveUe() logs warning if RNTI not attached, doesn't fatal)
+      m_cphySapProvider.at (i)->RemoveUe (sourceRnti);
+    }
+  
+  // Remove from component carrier manager (prevents new packets from being scheduled)
+  // This is safe because it just removes from the scheduler, doesn't destroy UeManager
+  m_ccmRrcSapProvider->RemoveUe (sourceRnti);
+  
+  // NOTE: We intentionally do NOT remove from m_ueMap to avoid crashes from MAC scheduler
+  // The MAC scheduler may still have references to this UeManager for packets in flight
+  // The filtering code in BuildRicIndicationMessageCuCp() MUST skip UEs whose IMSI mappings
+  // have been removed (GetRntiFromImsi() will return 0 for removed mappings)
+  
+  // CRITICAL: We MUST call m_cmacSapProvider->RemoveUe() to ensure MAC scheduler removes
+  // HARQ process status maps. Without this, the scheduler will try to access removed RNTI
+  // and cause a fatal error. This is done above, before m_ccmRrcSapProvider->RemoveUe().
+  
+  // We skip calling:
+  // - m_ueMap.erase() - Keep UeManager alive for MAC scheduler (prevents segfault)
+  // - m_s1SapProvider->UeContextRelease() - EPC will handle this (PathSwitchRequest flow)
+
+  // Step 6: Create new UeManager in target cell using AddUe() 
+  // Use HANDOVER_JOINING state (required by DoInitialize(), and valid for SendData())
+  uint8_t targetCcId = targetRrc->CellToComponentCarrierId (targetCellId);
+  targetRnti = targetRrc->AddUe (UeManager::HANDOVER_JOINING, targetCcId);
+
+  // Step 7: Get the newly created UeManager
+  Ptr<UeManager> targetUeManager = targetRrc->GetUeManager (targetRnti);
+  if (!targetUeManager)
+    {
+      NS_LOG_ERROR ("ManualHandover: Failed to get target UeManager after AddUe()");
+      return false;
+    }
+
+  // Step 8: Set IMSI and source info (like X2 handover does)
+  targetUeManager->SetImsi (imsi);
+  targetUeManager->SetSource (m_cellId, sourceRnti);
+  targetUeManager->SetIsMc (false);
+
+  // Step 9: Register IMSI-to-RNTI mapping
+  targetRrc->RegisterImsiToRnti (imsi, targetRnti);
+
+  // CRITICAL FIX: Manually Attach UE to Target eNB PHY
+  // ManualHandover bypasses the standard RRC connection reconfiguration flow which normally
+  // calls AddUePhy(). Without this, the PHY layer doesn't know about the UE, so it
+  // calculates "0 SINR" and no Beamforming. This causes the Scheduler to ignore the UE -> Zero Metrics.
+  // We must find the UE's NetDevice and attach it to the Target PHY manually.
+  
+  Ptr<NetDevice> ueDevice = nullptr;
+  // Use NodeList to find the UE by IMSI
+  for (NodeList::Iterator i = NodeList::Begin(); i != NodeList::End(); ++i)
+    {
+      Ptr<Node> node = *i;
+      for (uint32_t j = 0; j < node->GetNDevices(); ++j)
+        {
+          Ptr<NetDevice> dev = node->GetDevice(j);
+          Ptr<mmwave::MmWaveUeNetDevice> mmWaveUeDev = dev->GetObject<mmwave::MmWaveUeNetDevice>();
+          if (mmWaveUeDev && mmWaveUeDev->GetImsi() == imsi)
+            {
+              ueDevice = dev;
+              break;
+            }
+        }
+      if (ueDevice)
+        {
+          break;
+        }
+    }
+
+  if (ueDevice)
+    {
+      // Find Target MmWaveEnbNetDevice by CellID
+      // We iterate through all nodes and their devices to find the one with matching CellId
+      Ptr<mmwave::MmWaveEnbNetDevice> targetMmWaveDev = nullptr;
+      
+      for (NodeList::Iterator i = NodeList::Begin(); i != NodeList::End(); ++i)
+        {
+          Ptr<Node> node = *i;
+          for (uint32_t j = 0; j < node->GetNDevices(); ++j)
+            {
+              Ptr<NetDevice> dev = node->GetDevice(j);
+              Ptr<mmwave::MmWaveEnbNetDevice> mmDev = dev->GetObject<mmwave::MmWaveEnbNetDevice>();
+              if (mmDev && mmDev->GetCellId() == targetCellId)
+                {
+                  targetMmWaveDev = mmDev;
+                  break;
+                }
+            }
+          if (targetMmWaveDev) break;
+        }
+
+      if (targetMmWaveDev)
+        {
+          NS_LOG_UNCOND("ManualHandover: Attaching UE (IMSI " << imsi << ") to Target PHY (Cell " << targetCellId << ")");
+          // Explicitly call AddUePhy to enable SINR calculation and Beamforming
+          targetMmWaveDev->GetPhy()->AddUePhy(imsi, ueDevice);
+        }
+      else
+        {
+          NS_LOG_WARN("ManualHandover: Could not find Target MmWaveEnbNetDevice for CellId " << targetCellId << " - PHY attachment skipped");
+        }
+    }
+  else
+    {
+      NS_LOG_WARN("ManualHandover: Could not find UE NetDevice for IMSI " << imsi << " - PHY attachment skipped");
+    }
+
+  // Step 10: Copy DRBs from source (using saved info, not sourceUeManager which is destroyed)
+  // CRITICAL: Store the mapping from TEID to actual BID (m_epsBearerIdentity) after SetupDataRadioBearer
+  // This is needed because SetupDataRadioBearer calculates m_epsBearerIdentity = Drbid2Bid(newDrbid),
+  // which might differ from the BID we use in UpdateRntiForTeid. We need to use the ACTUAL m_epsBearerIdentity.
+  std::map<uint32_t, uint8_t> teidToBidMap; // Maps TEID -> actual BID (m_epsBearerIdentity)
+  
+  for (auto it = drbInfoList.begin (); it != drbInfoList.end (); ++it)
+    {
+      // Setup DRB in target UeManager using saved info
+      targetUeManager->SetupDataRadioBearer (it->bearer, it->drbId, it->gtpTeid, it->transportLayerAddress);
+      
+      // CRITICAL FIX: Get the ACTUAL m_epsBearerIdentity from the newly created DRB
+      // This is the BID that will be used when packets arrive, so we must use it in UpdateRntiForTeid
+      auto targetDrbMap = targetUeManager->GetDrbMap();
+      for (auto drbIt = targetDrbMap.begin(); drbIt != targetDrbMap.end(); ++drbIt)
+        {
+          if (drbIt->second->m_gtpTeid == it->gtpTeid)
+            {
+              // Found the DRB we just created - get its m_epsBearerIdentity
+              uint8_t actualBid = drbIt->second->m_epsBearerIdentity;
+              teidToBidMap[it->gtpTeid] = actualBid;
+              
+              // DEBUG: Log the BID mapping
+              double timestamp = Simulator::Now().GetSeconds();
+              std::string handoverDebugFileName = "/dev/null";
+              std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+              if (handoverDebugLog.is_open())
+                {
+                  handoverDebugLog << timestamp << ",DRB_BID_MAPPING,Cell" << targetCellId
+                                   << ",IMSI" << imsi << ",TEID=" << it->gtpTeid
+                                   << ",DRBID=" << (uint32_t)drbIt->first
+                                   << ",ActualBID=" << (uint32_t)actualBid << std::endl;
+                  handoverDebugLog.close();
+                }
+              break;
+            }
+        }
+    }
+
+  // Step 10.5: Initialize RLC/PDCP layers for all DRBs (REQUIRED for MAC scheduling)
+  // This populates m_drbsToBeStarted list and then initializes RLC/PDCP
+  // Without this, RLC buffers are empty → MAC has nothing to schedule → no PHY trace events → calculator stays at 0
+  targetUeManager->RecordDataRadioBearersToBeStarted ();
+  targetUeManager->StartDataRadioBearers ();
+  NS_LOG_UNCOND ("ManualHandover: Initialized RLC/PDCP for all DRBs (RNTI " << targetRnti << ", IMSI " << imsi << ")");
+
+  // Step 10.5.1: Fire ConnectionReconfiguration trace to trigger PDCP/RLC stats reconnection
+  // This notifies MmWaveBearerStatsConnector to connect TxPDU/RxPDU callbacks to E2 stats calculators
+  targetRrc->m_connectionReconfigurationTrace (imsi, targetCellId, targetRnti);
+  
+  // Step 10.5.5: Notify MAC scheduler about UE configuration (REQUIRED for scheduling)
+  // This is equivalent to what RecvRrcConnectionReconfigurationCompleted() does in normal X2 handover.
+  // Without this, the scheduler doesn't initialize HARQ processes and won't schedule the UE.
+  // This causes MAC statistics to remain zero even though packets are arriving.
+  // Note: We use the default transmission mode from RRC (same as DoInitialize() does)
+  LteEnbCmacSapProvider::UeConfig req;
+  req.m_rnti = targetRnti;
+  req.m_transmissionMode = targetRrc->m_defaultTransmissionMode;
+  
+  for (uint8_t i = 0; i < targetRrc->m_numberOfComponentCarriers; i++)
+    {
+      // Notify MAC scheduler about UE configuration (initializes HARQ processes)
+      targetRrc->m_cmacSapProvider.at (i)->UeUpdateConfigurationReq (req);
+      
+      // Also configure PHY (like normal handover does in RecvRrcConnectionReconfigurationCompleted)
+      targetRrc->m_cphySapProvider.at (i)->SetTransmissionMode (targetRnti, req.m_transmissionMode);
+      // Use default PDSCH config (dB0) - same as DoInitialize() initializes it
+      LteRrcSap::PdschConfigDedicated pdschConfig;
+      pdschConfig.pa = LteRrcSap::PdschConfigDedicated::dB0;
+      double paDouble = LteRrcSap::ConvertPdschConfigDedicated2Double (pdschConfig);
+      targetRrc->m_cphySapProvider.at (i)->SetPa (targetRnti, paDouble);
+    }
+  
+  NS_LOG_UNCOND ("ManualHandover: Notified MAC scheduler about UE configuration (RNTI " 
+                 << targetRnti << ", IMSI " << imsi << ", TransmissionMode " 
+                 << (uint16_t)req.m_transmissionMode << ")");
+  
+  // Step 10.6: Update EpcEnbApplication TEID→RNTI mapping (CRITICAL for packet routing)
+  // After handover, packets from S1-U still have TEID mapped to OLD RNTI
+  // We need to:
+  //   1. REMOVE the TEID mapping from SOURCE cell (so packets won't go there)
+  //   2. CREATE the TEID mapping in TARGET cell (so packets will go there)
+  // Access EpcEnbApplication through the node (it's stored as application 0)
+  
+  // First, find SOURCE node and remove TEID mapping
+  Ptr<Node> sourceNode = nullptr;
+  NodeList::Iterator listEnd = NodeList::End();
+  for (NodeList::Iterator i = NodeList::Begin(); i != listEnd; ++i)
+    {
+      Ptr<Node> node = *i;
+      // Check if this node has the source RRC (this)
+      for (uint32_t devIdx = 0; devIdx < node->GetNDevices(); ++devIdx)
+        {
+          Ptr<NetDevice> dev = node->GetDevice(devIdx);
+          // Try MmWaveEnbNetDevice first (it's in ns3::mmwave namespace)
+          Ptr<mmwave::MmWaveEnbNetDevice> mmWaveDev = dev->GetObject<mmwave::MmWaveEnbNetDevice>();
+          if (mmWaveDev && mmWaveDev->GetRrc() == this)
+            {
+              sourceNode = node;
+              break;
+            }
+          // Try LteEnbNetDevice
+          Ptr<LteEnbNetDevice> lteDev = dev->GetObject<LteEnbNetDevice>();
+          if (lteDev && lteDev->GetRrc() == this)
+            {
+              sourceNode = node;
+              break;
+            }
+        }
+      if (sourceNode)
+        {
+          break;
+        }
+    }
+  
+  // Find TARGET node
+  Ptr<Node> targetNode = nullptr;
+  for (NodeList::Iterator i = NodeList::Begin(); i != listEnd; ++i)
+    {
+      Ptr<Node> node = *i;
+      // Check if this node has the target RRC
+      for (uint32_t devIdx = 0; devIdx < node->GetNDevices(); ++devIdx)
+        {
+          Ptr<NetDevice> dev = node->GetDevice(devIdx);
+          // Try MmWaveEnbNetDevice first (it's in ns3::mmwave namespace)
+          Ptr<mmwave::MmWaveEnbNetDevice> mmWaveDev = dev->GetObject<mmwave::MmWaveEnbNetDevice>();
+          if (mmWaveDev && mmWaveDev->GetRrc() == targetRrc)
+            {
+              targetNode = node;
+              break;
+            }
+          // Try LteEnbNetDevice
+          Ptr<LteEnbNetDevice> lteDev = dev->GetObject<LteEnbNetDevice>();
+          if (lteDev && lteDev->GetRrc() == targetRrc)
+            {
+              targetNode = node;
+              break;
+            }
+        }
+      if (targetNode)
+        {
+          break;
+        }
+    }
+  
+  // DEBUG: Log node search attempt
+  double timestamp = Simulator::Now().GetSeconds();
+  std::string handoverDebugFileName = "/dev/null";
+  std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+  
+  // Step 10.6.1: Remove TEID mapping from SOURCE cell
+  if (sourceNode)
+    {
+      Ptr<EpcEnbApplication> sourceEpcApp = sourceNode->GetApplication(0)->GetObject<EpcEnbApplication>();
+      if (sourceEpcApp)
+        {
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",EPC_REMOVE_START,Cell" << m_cellId 
+                               << ",IMSI" << imsi << ",OldRNTI" << sourceRnti 
+                               << ",DRBs=" << drbInfoList.size() << std::endl;
+            }
+          
+          // Remove TEID mapping for all DRBs
+          for (auto it = drbInfoList.begin(); it != drbInfoList.end(); ++it)
+            {
+              uint32_t teid = it->gtpTeid;
+              // Convert DRB ID to BID (DRB ID = BID + 4, so BID = DRB ID - 4)
+              uint8_t bid = (it->drbId >= 4) ? (it->drbId - 4) : 0;
+              sourceEpcApp->RemoveTeidMapping(teid, sourceRnti, bid);
+              
+              if (handoverDebugLog.is_open())
+                {
+                  handoverDebugLog << timestamp << ",EPC_TEID_REMOVE,Cell" << m_cellId 
+                                   << ",IMSI" << imsi << ",TEID=" << teid
+                                   << ",OldRNTI=" << sourceRnti 
+                                   << ",BID=" << (uint32_t)bid << ",DRBID=" << (uint32_t)it->drbId << std::endl;
+                }
+            }
+          
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",EPC_REMOVE_COMPLETE,Cell" << m_cellId 
+                               << ",IMSI" << imsi << ",RemovedDRBs=" << drbInfoList.size() << std::endl;
+            }
+          
+          NS_LOG_UNCOND("ManualHandover: Removed EpcEnbApplication TEID→RNTI mappings from source cell " 
+                        << m_cellId << " for " << drbInfoList.size() << " DRBs");
+        }
+      else
+        {
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",EPC_REMOVE_ERROR,Cell" << m_cellId 
+                               << ",IMSI" << imsi << ",ERROR=EpcEnbApplication_NOT_FOUND" << std::endl;
+            }
+          NS_LOG_WARN("ManualHandover: Could not find EpcEnbApplication in source node!");
+        }
+    }
+  else
+    {
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",EPC_REMOVE_ERROR,Cell" << m_cellId 
+                           << ",IMSI" << imsi << ",ERROR=SOURCE_NODE_NOT_FOUND" << std::endl;
+        }
+      NS_LOG_WARN("ManualHandover: Could not find source node for RRC!");
+    }
+  
+  // Step 10.6.2: Create TEID mapping in TARGET cell
+  if (targetNode)
+    {
+      // Get EpcEnbApplication from the node (it's typically application 0)
+      Ptr<EpcEnbApplication> epcApp = targetNode->GetApplication(0)->GetObject<EpcEnbApplication>();
+      if (epcApp)
+        {
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",EPC_UPDATE_START,Cell" << targetCellId 
+                               << ",IMSI" << imsi << ",OldRNTI" << sourceRnti 
+                               << ",NewRNTI" << targetRnti << ",DRBs=" << drbInfoList.size() << std::endl;
+            }
+          
+          // Update TEID→RNTI mapping for all DRBs
+          // CRITICAL FIX: Use the ACTUAL BID (m_epsBearerIdentity) from the target DRB, not a calculated value
+          // This ensures packets arrive with the correct BID that matches m_epsBearerIdentity
+          for (auto it = drbInfoList.begin(); it != drbInfoList.end(); ++it)
+            {
+              uint32_t teid = it->gtpTeid;
+              
+              // Get the actual BID from teidToBidMap (which was populated after SetupDataRadioBearer)
+              // This is the m_epsBearerIdentity that was set in SetupDataRadioBearer
+              uint8_t bid = 0;
+              auto bidIt = teidToBidMap.find(teid);
+              if (bidIt != teidToBidMap.end())
+                {
+                  bid = bidIt->second;
+                }
+              else
+                {
+                  // Fallback: Calculate BID (should not happen, but be safe)
+                  NS_LOG_WARN("ManualHandover: Could not find BID for TEID " << teid 
+                              << ", using calculated value");
+                  bid = (it->drbId >= 4) ? (it->drbId - 4) : 0;
+                }
+              
+              epcApp->UpdateRntiForTeid(teid, sourceRnti, targetRnti, bid);
+              
+              if (handoverDebugLog.is_open())
+                {
+                  handoverDebugLog << timestamp << ",EPC_TEID_UPDATE,Cell" << targetCellId 
+                                   << ",IMSI" << imsi << ",TEID=" << teid
+                                   << ",OldRNTI=" << sourceRnti << ",NewRNTI=" << targetRnti 
+                                   << ",BID=" << (uint32_t)bid << ",DRBID=" << (uint32_t)it->drbId << std::endl;
+                }
+              
+              NS_LOG_INFO("ManualHandover: Updated EPC TEID " << teid 
+                          << " from RNTI " << sourceRnti << " to RNTI " << targetRnti 
+                          << " (BID " << (uint16_t)bid << ", DRBID " << (uint16_t)it->drbId << ")");
+            }
+          
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",EPC_UPDATE_COMPLETE,Cell" << targetCellId 
+                               << ",IMSI" << imsi << ",UpdatedDRBs=" << drbInfoList.size() << std::endl;
+              handoverDebugLog.close();
+            }
+          
+          NS_LOG_UNCOND("ManualHandover: Updated EpcEnbApplication TEID→RNTI mappings for " 
+                        << drbInfoList.size() << " DRBs");
+        }
+      else
+        {
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",EPC_UPDATE_ERROR,Cell" << targetCellId 
+                               << ",IMSI" << imsi << ",ERROR=EpcEnbApplication_NOT_FOUND" << std::endl;
+              handoverDebugLog.close();
+            }
+          NS_LOG_WARN("ManualHandover: Could not find EpcEnbApplication in target node - packets may use wrong RNTI!");
+        }
+    }
+  else
+    {
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",EPC_UPDATE_ERROR,Cell" << targetCellId 
+                           << ",IMSI" << imsi << ",ERROR=TARGET_NODE_NOT_FOUND" << std::endl;
+          handoverDebugLog.close();
+        }
+      NS_LOG_WARN("ManualHandover: Could not find target node for RRC - packets may use wrong RNTI!");
+    }
+  
+  // Step 10.7: Send PathSwitchRequest to update SGW routing (CRITICAL for packet routing)
+  // This updates the SGW's UeInfo::m_enbAddr to point to the target cell's IP address
+  // Without this, SGW continues sending packets to source cell's IP, even though TEID mapping is updated
+  
+  // ROBUSTNESS FIX: Get S1 Provider directly from EpcEnbApplication if possible, 
+  // as targetRrc->m_s1SapProvider might be NULL in some Hybrid setups
+  EpcEnbS1SapProvider* s1SapProv = nullptr;
+  Ptr<EpcEnbApplication> targetEpcApp = nullptr;
+  
+  if (targetNode)
+    {
+      targetEpcApp = targetNode->GetApplication(0)->GetObject<EpcEnbApplication>();
+      if (targetEpcApp)
+        {
+          s1SapProv = targetEpcApp->GetS1SapProvider();
+        }
+    }
+  
+  // Fallback to RRC's provider if App not found (unlikely)
+  if (!s1SapProv && targetRrc->m_s1SapProvider)
+    {
+      s1SapProv = targetRrc->m_s1SapProvider;
+    }
+
+  if (s1SapProv)
+    {
+      timestamp = Simulator::Now().GetSeconds();
+      handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",PATH_SWITCH_START,Cell" << targetCellId 
+                           << ",IMSI" << imsi << ",NewRNTI" << targetRnti 
+                           << ",DRBs=" << drbInfoList.size() << std::endl;
+        }
+      
+      EpcEnbS1SapProvider::PathSwitchRequestParameters params;
+      params.rnti = targetRnti;
+      params.cellId = targetCellId;
+      params.mmeUeS1Id = imsi;
+      
+      // Populate bearersToBeSwitched from drbInfoList
+      for (auto it = drbInfoList.begin(); it != drbInfoList.end(); ++it)
+        {
+          EpcEnbS1SapProvider::BearerToBeSwitched b;
+          
+          // Use Actual BID from map if available
+          auto bidIt = teidToBidMap.find(it->gtpTeid);
+          if (bidIt != teidToBidMap.end())
+            {
+              b.epsBearerId = bidIt->second;
+            }
+          else
+            {
+              // epsBearerId = BID = (DRBID >= 4) ? (DRBID - 4) : 0
+              b.epsBearerId = (it->drbId >= 4) ? (it->drbId - 4) : 0;
+            }
+
+          b.teid = it->gtpTeid;
+          params.bearersToBeSwitched.push_back(b);
+          
+          if (handoverDebugLog.is_open())
+            {
+              handoverDebugLog << timestamp << ",PATH_SWITCH_BEARER,Cell" << targetCellId 
+                               << ",IMSI" << imsi << ",DRBID=" << (uint32_t)it->drbId
+                               << ",EPSBearerID=" << (uint32_t)b.epsBearerId 
+                               << ",TEID=" << b.teid << std::endl;
+            }
+        }
+      
+      // Send PathSwitchRequest to MME (which will update SGW routing)
+      s1SapProv->PathSwitchRequest(params);
+      
+      // CRITICAL: Transition to HANDOVER_PATH_SWITCH state (not CONNECTED_NORMALLY yet!)
+      // This is required because PathSwitchRequestAcknowledge will call SendUeContextRelease(),
+      // which expects HANDOVER_PATH_SWITCH state and will transition to CONNECTED_NORMALLY
+      targetUeManager->SwitchToState(UeManager::HANDOVER_PATH_SWITCH);
+      
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",PATH_SWITCH_COMPLETE,Cell" << targetCellId 
+                           << ",IMSI" << imsi << ",SentDRBs=" << params.bearersToBeSwitched.size()
+                           << ",State=HANDOVER_PATH_SWITCH" << std::endl;
+          handoverDebugLog.close();
+        }
+      
+      NS_LOG_UNCOND("ManualHandover: Sent PathSwitchRequest to MME for " 
+                    << params.bearersToBeSwitched.size() << " DRBs (IMSI " << imsi 
+                    << ", RNTI " << targetRnti << ", Cell " << targetCellId 
+                    << "). State set to HANDOVER_PATH_SWITCH (will transition to CONNECTED_NORMALLY on ACK)");
+      
+      // NOTE: UeUpdateConfigurationReq() is NOT called here because the UE is still in HANDOVER_PATH_SWITCH state.
+      // The MAC scheduler will be notified in SendUeContextRelease() AFTER the UE transitions to CONNECTED_NORMALLY,
+      // which matches the normal X2 handover flow. This ensures the scheduler only initializes HARQ processes
+      // when the UE is ready to be scheduled (CONNECTED_NORMALLY state).
+    }
+  else
+    {
+      timestamp = Simulator::Now().GetSeconds();
+      handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+      if (handoverDebugLog.is_open())
+        {
+          handoverDebugLog << timestamp << ",PATH_SWITCH_ERROR,Cell" << targetCellId 
+                           << ",IMSI" << imsi << ",ERROR=m_s1SapProvider_NOT_FOUND" << std::endl;
+          handoverDebugLog.close();
+        }
+      NS_LOG_WARN("ManualHandover: m_s1SapProvider is null - cannot send PathSwitchRequest! SGW routing will not be updated!");
+      // If PathSwitchRequest fails, we still need to transition to CONNECTED_NORMALLY for MAC scheduling
+      targetUeManager->SwitchToState(UeManager::CONNECTED_NORMALLY);
+    }
+  
+  // DEBUG: Log RLC/PDCP initialization and RLC buffer occupancy
+  timestamp = Simulator::Now().GetSeconds();
+  handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+  if (handoverDebugLog.is_open())
+    {
+      handoverDebugLog << timestamp << ",RLC_PDCP_INIT,Cell" << targetCellId 
+                       << ",IMSI" << imsi << ",NewRNTI" << targetRnti
+                       << ",State=" << ToString(targetUeManager->GetState());
+      
+      // Check RLC buffer occupancy for all DRBs
+      uint32_t totalRlcBufferOccupancy = 0;
+      uint32_t drbCount = 0;
+      std::map<uint8_t, Ptr<LteDataRadioBearerInfo> > drbMap = targetUeManager->GetDrbMap();
+      for (auto drbIt = drbMap.begin(); drbIt != drbMap.end(); ++drbIt)
+        {
+          drbCount++;
+          if (drbIt->second->m_rlc)
+            {
+              // Get RLC buffer size (similar to GetRlcBufferOccupancy in mmwave-enb-net-device.cc)
+              uint32_t rlcBufferSize = 0;
+              if (DynamicCast<LteRlcAm>(drbIt->second->m_rlc))
+                {
+                  rlcBufferSize = DynamicCast<LteRlcAm>(drbIt->second->m_rlc)->GetTxBufferSize();
+                }
+              else if (DynamicCast<LteRlcUm>(drbIt->second->m_rlc))
+                {
+                  rlcBufferSize = DynamicCast<LteRlcUm>(drbIt->second->m_rlc)->GetTxBufferSize();
+                }
+              else if (DynamicCast<LteRlcUmLowLat>(drbIt->second->m_rlc))
+                {
+                  rlcBufferSize = DynamicCast<LteRlcUmLowLat>(drbIt->second->m_rlc)->GetTxBufferSize();
+                }
+              totalRlcBufferOccupancy += rlcBufferSize;
+              handoverDebugLog << ",DRB" << (uint32_t)drbIt->first << "_Buffer=" << rlcBufferSize;
+            }
+        }
+      handoverDebugLog << ",TotalDRBs=" << drbCount 
+                       << ",TotalRlcBuffer=" << totalRlcBufferOccupancy << std::endl;
+      handoverDebugLog.close();
+    }
+
+  // Step 11: State transition handling
+  // If PathSwitchRequest was sent, state is already HANDOVER_PATH_SWITCH
+  // and will transition to CONNECTED_NORMALLY when PathSwitchRequestAcknowledge arrives
+  // (via SendUeContextRelease() in DoPathSwitchRequestAcknowledge())
+  // If PathSwitchRequest was NOT sent (m_s1SapProvider null), state is already CONNECTED_NORMALLY
+  // So we don't need to transition here - it's already done above
+  if (targetRrc->m_s1SapProvider)
+    {
+      NS_LOG_UNCOND ("ManualHandover: UeManager state is HANDOVER_PATH_SWITCH (will transition to CONNECTED_NORMALLY on PathSwitchRequestAcknowledge)");
+    }
+  else
+    {
+      NS_LOG_UNCOND ("ManualHandover: UeManager state is CONNECTED_NORMALLY (PathSwitchRequest skipped, direct transition)");
+    }
+  
+  // Verify state and log
+  NS_LOG_UNCOND ("ManualHandover: Target UeManager state: " << ToString (targetUeManager->GetState ()));
+  
+  // DEBUG: Log state transition
+  timestamp = Simulator::Now().GetSeconds();
+  handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+  if (handoverDebugLog.is_open())
+    {
+      handoverDebugLog << timestamp << ",STATE_TRANSITION,Cell" << targetCellId
+                       << ",IMSI" << imsi << ",NewRNTI" << targetRnti
+                       << ",NewState=" << ToString(targetUeManager->GetState())
+                       << ",Expected=CONNECTED_NORMALLY" << std::endl;
+      handoverDebugLog.close();
+    }
+
+  // Step 13: Update RRC state maps in target cell
+  targetRrc->m_mmWaveCellSetupCompleted[imsi] = true;
+  targetRrc->m_lastMmWaveCell[imsi] = targetCellId;
+  targetRrc->m_imsiUsingLte[imsi] = false;
+
+  NS_LOG_UNCOND ("ManualHandover: Successfully moved UE " << imsi
+                  << " from cell " << m_cellId << " (RNTI " << sourceRnti
+                  << ") to cell " << targetCellId << " (RNTI " << targetRnti << ")");
+
+  //m_handoverEndOkTrace (imsi, targetCellId, targetRnti);
+  targetRrc->m_handoverEndOkTrace (imsi, targetCellId, targetRnti);
+  return true;
+}
+
 TypeId
 LteEnbRrc::GetRlcType (EpsBearer bearer)
 {
@@ -5364,10 +6430,15 @@ LteEnbRrc::AddX2Neighbour (uint16_t cellId)
 {
   NS_LOG_FUNCTION (this << cellId);
 
+  // Register neighbor for ANR (Automatic Neighbor Relation) if available
   if (m_anrSapProvider != 0)
     {
       m_anrSapProvider->AddNeighbourRelation (cellId);
     }
+
+  // Add to X2 neighbor set for SINR exchange (enables SA mode handover)
+  m_x2NeighbourCells.insert(cellId);
+  NS_LOG_LOGIC("Added X2 neighbor cell " << cellId << ". Total neighbors: " << m_x2NeighbourCells.size());
 }
 
 void

@@ -35,6 +35,8 @@
 #include "ns3/ipv6.h"
 #include "ns3/log.h"
 #include "ns3/mac48-address.h"
+#include "ns3/simulator.h"
+#include <fstream>
 
 namespace ns3
 {
@@ -395,19 +397,78 @@ EpcSgwPgwApplication::DoModifyBearerRequest(EpcS11SapSgw::ModifyBearerRequestMes
 {
     NS_LOG_FUNCTION(this << req.teid);
     uint64_t imsi = req.teid; // trick to avoid the need for allocating TEIDs on the S11 interface
+    
+    // DEBUG: Log ModifyBearerRequest received
+    double timestamp = Simulator::Now().GetSeconds();
+    std::string handoverDebugFileName = "/dev/null";
+    std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",SGW_MODIFY_BEARER_RECEIVED,IMSI" << imsi 
+                         << ",CellId=" << req.uli.gci << std::endl;
+        handoverDebugLog.close();
+      }
+    
     std::map<uint64_t, Ptr<UeInfo>>::iterator ueit = m_ueInfoByImsiMap.find(imsi);
     NS_ASSERT_MSG(ueit != m_ueInfoByImsiMap.end(), "unknown IMSI " << imsi);
     uint16_t cellId = req.uli.gci;
     std::map<uint16_t, EnbInfo>::iterator enbit = m_enbInfoByCellId.find(cellId);
-    NS_ASSERT_MSG(enbit != m_enbInfoByCellId.end(), "unknown CellId " << cellId);
+    
+    if (enbit == m_enbInfoByCellId.end())
+      {
+        // DEBUG: Log error - CellId not found
+        timestamp = Simulator::Now().GetSeconds();
+        handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+        if (handoverDebugLog.is_open())
+          {
+            handoverDebugLog << timestamp << ",SGW_MODIFY_BEARER_ERROR,IMSI" << imsi 
+                             << ",CellId=" << cellId << ",ERROR=CELLID_NOT_FOUND" << std::endl;
+            handoverDebugLog.close();
+          }
+        NS_ASSERT_MSG(enbit != m_enbInfoByCellId.end(), "unknown CellId " << cellId);
+      }
+    
+    Ipv4Address oldEnbAddr = ueit->second->GetEnbAddr();
     Ipv4Address enbAddr = enbit->second.enbAddr;
     ueit->second->SetEnbAddr(enbAddr);
+    
+    // DEBUG: Log enbAddr update
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",SGW_ENB_ADDR_UPDATED,IMSI" << imsi 
+                         << ",CellId=" << cellId << ",OldEnbAddr=" << oldEnbAddr 
+                         << ",NewEnbAddr=" << enbAddr << std::endl;
+        handoverDebugLog.close();
+      }
+    
     // no actual bearer modification: for now we just support the minimum needed for path switch
     // request (handover)
     EpcS11SapMme::ModifyBearerResponseMessage res;
     res.teid = imsi; // trick to avoid the need for allocating TEIDs on the S11 interface
     res.cause = EpcS11SapMme::ModifyBearerResponseMessage::REQUEST_ACCEPTED;
+    
+    // DEBUG: Log ModifyBearerResponse about to be sent
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",SGW_MODIFY_BEARER_RESPONSE_SENDING,IMSI" << imsi 
+                         << ",Cause=REQUEST_ACCEPTED" << std::endl;
+        handoverDebugLog.close();
+      }
+    
     m_s11SapMme->ModifyBearerResponse(res);
+    
+    // DEBUG: Log ModifyBearerResponse sent
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",SGW_MODIFY_BEARER_RESPONSE_SENT,IMSI" << imsi << std::endl;
+        handoverDebugLog.close();
+      }
 }
 
 void

@@ -30,6 +30,8 @@
 
 #include <ns3/fatal-error.h>
 #include <ns3/log.h>
+#include <ns3/simulator.h>
+#include <fstream>
 
 namespace ns3
 {
@@ -185,11 +187,33 @@ EpcMmeApplication::DoPathSwitchRequest(
     it->second->cellId = gci;
     it->second->enbUeS1Id = enbUeS1Id;
 
+    // DEBUG: Log PathSwitchRequest received
+    double timestamp = Simulator::Now().GetSeconds();
+    std::string handoverDebugFileName = "/dev/null";
+    std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",MME_PATH_SWITCH_RECEIVED,IMSI" << imsi 
+                         << ",OldCellId=" << it->second->cellId << ",NewCellId=" << gci 
+                         << ",EnbUeS1Id=" << enbUeS1Id << std::endl;
+        handoverDebugLog.close();
+      }
+
     EpcS11SapSgw::ModifyBearerRequestMessage msg;
     msg.teid = imsi; // trick to avoid the need for allocating TEIDs on the S11 interface
     msg.uli.gci = gci;
     // bearer modification is not supported for now
     m_s11SapSgw->ModifyBearerRequest(msg);
+    
+    // DEBUG: Log ModifyBearerRequest sent
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",MME_MODIFY_BEARER_SENT,IMSI" << imsi 
+                         << ",CellId=" << gci << std::endl;
+        handoverDebugLog.close();
+      }
 }
 
 // S11 SAP MME forwarded methods
@@ -236,15 +260,48 @@ EpcMmeApplication::DoModifyBearerResponse(EpcS11SapMme::ModifyBearerResponseMess
     uint64_t enbUeS1Id = it->second->enbUeS1Id;
     uint64_t mmeUeS1Id = it->second->mmeUeS1Id;
     uint16_t cgi = it->second->cellId;
+    
+    // DEBUG: Log ModifyBearerResponse received
+    double timestamp = Simulator::Now().GetSeconds();
+    std::string handoverDebugFileName = "/dev/null";
+    std::ofstream handoverDebugLog(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",MME_MODIFY_BEARER_RECEIVED,IMSI" << imsi 
+                         << ",CellId=" << cgi << ",Cause=REQUEST_ACCEPTED" << std::endl;
+        handoverDebugLog.close();
+      }
+    
     std::list<EpcS1apSapEnb::ErabSwitchedInUplinkItem>
         erabToBeSwitchedInUplinkList; // unused for now
     std::map<uint16_t, Ptr<EnbInfo>>::iterator jt = m_enbInfoMap.find(it->second->cellId);
     NS_ASSERT_MSG(jt != m_enbInfoMap.end(),
                   "could not find any eNB with CellId " << it->second->cellId);
+    
+    // DEBUG: Log PathSwitchRequestAcknowledge about to be sent
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",MME_PATH_SWITCH_ACK_SENDING,IMSI" << imsi 
+                         << ",CellId=" << cgi << ",EnbUeS1Id=" << enbUeS1Id << std::endl;
+        handoverDebugLog.close();
+      }
+    
     m_s1apSapMmeProvider->SendPathSwitchRequestAcknowledge(enbUeS1Id,
                                                            mmeUeS1Id,
                                                            cgi,
                                                            erabToBeSwitchedInUplinkList);
+    
+    // DEBUG: Log PathSwitchRequestAcknowledge sent
+    timestamp = Simulator::Now().GetSeconds();
+    handoverDebugLog.open(handoverDebugFileName.c_str(), std::ios::app);
+    if (handoverDebugLog.is_open())
+      {
+        handoverDebugLog << timestamp << ",MME_PATH_SWITCH_ACK_SENT,IMSI" << imsi 
+                         << ",CellId=" << cgi << std::endl;
+        handoverDebugLog.close();
+      }
 }
 
 void

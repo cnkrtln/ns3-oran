@@ -171,6 +171,10 @@ MmWaveUePhy::DoInitialize(void)
     m_slotPeriod = m_phyMacConfig->GetSubframePeriod() / m_phyMacConfig->GetSlotsPerSubframe();
     m_phyReset = true;
 
+    Ptr<SpectrumValue> noisePsd =
+        MmWaveSpectrumValueHelper::CreateNoisePowerSpectralDensity(m_phyMacConfig, m_noiseFigure);
+    m_downlinkSpectrumPhy->SetNoisePowerSpectralDensity(noisePsd);
+
     MmWavePhy::DoInitialize();
 }
 

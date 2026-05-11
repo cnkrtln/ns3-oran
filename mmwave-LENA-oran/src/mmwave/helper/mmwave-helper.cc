@@ -42,6 +42,7 @@
 #include <ns3/epc-x2.h>
 #include <ns3/file-beamforming-codebook.h>
 #include <ns3/friis-spectrum-propagation-loss.h>
+#include <ns3/two-ray-spectrum-propagation-loss-model.h>
 #include <ns3/ipv4.h>
 #include <ns3/isotropic-antenna-model.h>
 #include <ns3/log.h>
@@ -461,6 +462,42 @@ MmWaveHelper::MmWaveChannelModelInitialization (void)
                 }
                 // set the propagation loss model in the channel
                 channel->AddPhasedArraySpectrumPropagationLossModel(threeGppSplm);
+            }
+            else if (m_spectrumPropagationLossModelType == "ns3::TwoRaySpectrumPropagationLossModel")
+            {
+                // TwoRaySpectrumPropagationLossModel is a PhasedArraySpectrumPropagationLossModel
+                // and needs similar handling to ThreeGppSpectrumPropagationLossModel
+                Ptr<TwoRaySpectrumPropagationLossModel> twoRaySplm =
+                    m_spectrumPropagationLossModelFactory
+                        .Create<TwoRaySpectrumPropagationLossModel>();
+                
+                // Frequency will be set by factory attributes, but override with actual frequency
+                twoRaySplm->SetAttributeFailSafe("Frequency",
+                                                 DoubleValue(phyMacCommon->GetCenterFrequency()));
+
+                // Set ChannelConditionModel if available
+                if (ccm) // the channel condition model was created using the factory
+                {
+                    twoRaySplm->SetAttributeFailSafe("ChannelConditionModel",
+                                                    PointerValue(ccm));
+                }
+                else if (!m_pathlossModel.empty()) // the channel condition model was created inside
+                                                   // the propagation loss model
+                {
+                    PointerValue ptr;
+                    m_pathlossModel.at(it->first)->GetAttribute("ChannelConditionModel", ptr);
+                    ccm = ptr.Get<ChannelConditionModel>();
+                    if (ccm)
+                    {
+                        twoRaySplm->SetAttributeFailSafe("ChannelConditionModel",
+                                                          PointerValue(ccm));
+                    }
+                }
+                // Note: Factory attributes (set via SetChannelModelAttribute) should already
+                // have ChannelConditionModel set, but we check ccm as fallback
+                
+                // set the propagation loss model in the channel
+                channel->AddPhasedArraySpectrumPropagationLossModel(twoRaySplm);
             }
             else
             {
@@ -992,11 +1029,14 @@ MmWaveHelper::InstallSingleMcUeDevice(Ptr<Node> n)
             threeGppSplm = DynamicCast<ThreeGppSpectrumPropagationLossModel>(splm);
         }
 
-        auto channelModel = threeGppSplm->GetChannelModel();
         Ptr<MmWaveBeamformingModel> bfModel = m_bfModelFactory.Create<MmWaveBeamformingModel>();
         bfModel->SetAttributeFailSafe("Device", PointerValue(device));
         bfModel->SetAttributeFailSafe("Antenna", PointerValue(antenna));
-        bfModel->SetAttributeFailSafe("ChannelModel", PointerValue(channelModel));
+        if (threeGppSplm)
+        {
+            auto channelModel = threeGppSplm->GetChannelModel();
+            bfModel->SetAttributeFailSafe("ChannelModel", PointerValue(channelModel));
+        }
         dlPhy->SetBeamformingModel(bfModel);
 
         it->second->SetPhy(phy);
@@ -1649,12 +1689,14 @@ MmWaveHelper::InstallSingleUeDevice(Ptr<Node> n)
             threeGppSplm = DynamicCast<ThreeGppSpectrumPropagationLossModel>(splm);
         }
 
-        auto channelModel = threeGppSplm->GetChannelModel();
-
         Ptr<MmWaveBeamformingModel> bfModel = m_bfModelFactory.Create<MmWaveBeamformingModel>();
         bfModel->SetAttributeFailSafe("Device", PointerValue(device));
         bfModel->SetAttributeFailSafe("Antenna", PointerValue(antenna));
-        bfModel->SetAttributeFailSafe("ChannelModel", PointerValue(channelModel));
+        if (threeGppSplm)
+        {
+            auto channelModel = threeGppSplm->GetChannelModel();
+            bfModel->SetAttributeFailSafe("ChannelModel", PointerValue(channelModel));
+        }
 
         if (pSplm)
         {
@@ -1679,6 +1721,9 @@ MmWaveHelper::InstallSingleUeDevice(Ptr<Node> n)
 
         DynamicCast<MmWaveComponentCarrierUe>(it->second)->SetPhy(phy);
         it->second->SetAntenna(antenna);
+
+        // Connect the trace directly to the object to avoid Config path issues
+        dlPhy->TraceConnectWithoutContext("RxPacketTraceUe", MakeBoundCallback(&MmWavePhyTrace::RxPacketTraceUeCallback, m_phyStats, "RxPacketTraceUe"));
     }
 
     Ptr<LteUeComponentCarrierManager> ccmUe =
@@ -1830,10 +1875,8 @@ MmWaveHelper::InstallSingleEnbDevice(Ptr<Node> n)
     NS_ABORT_MSG_IF(m_useCa && ccMap.size() < 2,
                     "You have to either specify carriers or disable carrier aggregation");
     NS_ASSERT(ccMap.size() == m_noOfCcs);
-    printf("iam here ");
     for (auto it = ccMap.begin(); it != ccMap.end(); ++it)
-    {   
-        printf ("iam in for ");
+    {
         NS_LOG_DEBUG(this << "component carrier map size " << (uint16_t)ccMap.size());
         Ptr<MmWaveComponentCarrierEnb> ccEnb = DynamicCast<MmWaveComponentCarrierEnb>(it->second);
 
@@ -1923,12 +1966,14 @@ MmWaveHelper::InstallSingleEnbDevice(Ptr<Node> n)
             threeGppSplm = DynamicCast<ThreeGppSpectrumPropagationLossModel>(splm);
         }
 
-        auto channelModel = threeGppSplm->GetChannelModel();
-
         Ptr<MmWaveBeamformingModel> bfModel = m_bfModelFactory.Create<MmWaveBeamformingModel>();
         bfModel->SetAttributeFailSafe("Device", PointerValue(device));
         bfModel->SetAttributeFailSafe("Antenna", PointerValue(antenna));
-        bfModel->SetAttributeFailSafe("ChannelModel", PointerValue(channelModel));
+        if (threeGppSplm)
+        {
+            auto channelModel = threeGppSplm->GetChannelModel();
+            bfModel->SetAttributeFailSafe("ChannelModel", PointerValue(channelModel));
+        }
 
         if (pSplm)
         {// initialize the 3GPP channel model
@@ -3191,13 +3236,13 @@ MmWaveHelper::EnableE2PdcpTraces (void)
     m_e2PdcpStats = CreateObject<MmWaveBearerStatsCalculator> ("E2PDCP");
     m_e2PdcpStats->SetAttribute("DlPdcpOutputFilename", StringValue("DlE2PdcpStats.txt"));
     m_e2PdcpStats->SetAttribute("UlPdcpOutputFilename", StringValue("UlE2PdcpStats.txt"));
-    m_e2PdcpStats->SetAttribute("EpochDuration", TimeValue(Seconds(1)));
+    m_e2PdcpStats->SetAttribute("EpochDuration", TimeValue(Seconds(0.1)));  // 100ms to match BuildGUICuUp frequency
     m_radioBearerStatsConnector->EnableE2PdcpStats (m_e2PdcpStats);
 
     m_e2PdcpStatsLte = CreateObject<MmWaveBearerStatsCalculator> ("E2PDCPLTE");
     m_e2PdcpStatsLte->SetAttribute("DlPdcpOutputFilename", StringValue("DlE2PdcpStatsLte.txt"));
     m_e2PdcpStatsLte->SetAttribute("UlPdcpOutputFilename", StringValue("UlE2PdcpStatsLte.txt"));
-    m_e2PdcpStatsLte->SetAttribute("EpochDuration", TimeValue(Seconds(1)));
+    m_e2PdcpStatsLte->SetAttribute("EpochDuration", TimeValue(Seconds(0.1)));  // 100ms to match BuildGUICuUp frequency
     m_radioBearerStatsConnector->EnableE2PdcpStats (m_e2PdcpStatsLte);
   }
   else
@@ -3221,13 +3266,13 @@ MmWaveHelper::EnableE2RlcTraces (void)
     m_e2RlcStats = CreateObject<MmWaveBearerStatsCalculator> ("E2RLC");
     m_e2RlcStats->SetAttribute("DlPdcpOutputFilename", StringValue("DlE2RlcStats.txt"));
     m_e2RlcStats->SetAttribute("UlPdcpOutputFilename", StringValue("UlE2RlcStats.txt"));
-    m_e2RlcStats->SetAttribute("EpochDuration", TimeValue(Seconds(1)));
+    m_e2RlcStats->SetAttribute("EpochDuration", TimeValue(Seconds(0.1)));  // 100ms to match BuildGUICuUp frequency
     m_radioBearerStatsConnector->EnableE2RlcStats (m_e2RlcStats);
 
     m_e2RlcStatsLte = CreateObject<MmWaveBearerStatsCalculator> ("E2RLCLTE");
     m_e2RlcStatsLte->SetAttribute("DlPdcpOutputFilename", StringValue("DlE2RlcStatsLte.txt"));
     m_e2RlcStatsLte->SetAttribute("UlPdcpOutputFilename", StringValue("UlE2RlcStatsLte.txt"));
-    m_e2RlcStatsLte->SetAttribute("EpochDuration", TimeValue(Seconds(1)));
+    m_e2RlcStatsLte->SetAttribute("EpochDuration", TimeValue(Seconds(0.1)));  // 100ms to match BuildGUICuUp frequency
     m_radioBearerStatsConnector->EnableE2RlcStats (m_e2RlcStatsLte);
   }
   else
@@ -3307,5 +3352,22 @@ MmWaveHelper::GetStartTime ()
  
   return (time_now.tv_sec * 1000) + (time_now.tv_usec / 1000);
 }
+
+void
+MmWaveHelper::ForceReconnectE2StatsForUe(uint64_t imsi, uint16_t rnti, uint16_t cellId)
+{
+    NS_LOG_FUNCTION(this << imsi << rnti << cellId);
+    
+    if (m_radioBearerStatsConnector)
+    {
+        NS_LOG_INFO("MmWaveHelper: Forcing E2 stats reconnection for IMSI " << imsi);
+        m_radioBearerStatsConnector->ForceReconnectStatsForUe(imsi, rnti, cellId);
+    }
+    else
+    {
+        NS_LOG_WARN("MmWaveHelper: Radio bearer stats connector not initialized - cannot reconnect");
+    }
+}
+
 }
 }

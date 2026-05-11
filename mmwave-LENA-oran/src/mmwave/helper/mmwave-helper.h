@@ -369,6 +369,16 @@ class MmWaveHelper : public Object
     void EnableE2RlcTraces (void);
     Ptr<MmWaveBearerStatsCalculator> GetE2RlcStats (void);
 
+    /**
+     * Force reconnection of E2 PDCP/RLC stats traces for a UE after manual handover.
+     * Call this after performing a manual handover to ensure throughput metrics work.
+     * 
+     * @param imsi UE's IMSI
+     * @param rnti UE's new RNTI in target cell  
+     * @param cellId Target cell ID
+     */
+    void ForceReconnectE2StatsForUe(uint64_t imsi, uint16_t rnti, uint16_t cellId);
+
     void SetBasicCellId (uint16_t basicCellId);
     uint16_t GetBasicCellId () const;
   protected:

@@ -337,6 +337,20 @@ MmWaveUeMac::DoTransmitPdu(LteMacSapProvider::TransmitPduParameters params)
 
         MacSubheader subheader(params.lcid, params.pdu->GetSize());
         it->second.m_macHeader.AddSubheader(subheader); // add RLC PDU sub-header into MAC header
+        
+        // Validate HARQ process ID before accessing vectors
+        // params.harqProcessId can be invalid (>= GetNumHarqProcess()) if UE was removed during handover
+        if (params.harqProcessId >= m_phyMacConfig->GetNumHarqProcess())
+        {
+            // Invalid HARQ process ID - UE may have been removed during handover
+            NS_LOG_WARN("Invalid UL HARQ process ID " << (uint16_t)params.harqProcessId 
+                        << " in DoTransmitPdu for UE RNTI " << params.rnti 
+                        << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                        << ") - skipping PDU transmission (UE may have been removed during handover)");
+            m_macPduMap.erase(it); // delete map entry
+            return; // Skip this PDU transmission
+        }
+        
         m_miUlHarqProcessesPacket.at(params.harqProcessId).m_lcidList.push_back(params.lcid);
         if (it->second.m_size <
             (params.pdu->GetSize() + it->second.m_macHeader.GetSerializedSize()))
@@ -687,6 +701,19 @@ MmWaveUeMac::DoReceiveControlMessage(Ptr<MmWaveControlMessage> msg)
         if (dciInfoElem.m_format == DciInfoElementTdma::UL_dci)
         {
             NS_LOG_DEBUG("UE MAC " << (uint32_t)m_componentCarrierId << " received UL_DCI");
+            
+            // Validate HARQ process ID before accessing vectors
+            // dciInfoElem.m_harqProcess can be invalid (>= GetNumHarqProcess()) if UE was removed during handover
+            if (dciInfoElem.m_harqProcess >= m_phyMacConfig->GetNumHarqProcess())
+            {
+                // Invalid HARQ process ID - UE may have been removed during handover
+                NS_LOG_WARN("Invalid UL HARQ process ID " << (uint16_t)dciInfoElem.m_harqProcess 
+                            << " in DCI for UE RNTI " << m_rnti 
+                            << " (max is " << (uint16_t)(m_phyMacConfig->GetNumHarqProcess() - 1) 
+                            << ") - skipping DCI processing (UE may have been removed during handover)");
+                return; // Skip this DCI processing
+            }
+            
             if (dciInfoElem.m_ndi == 1)
             {
                 // New transmission -> empty pkt buffer queue (for deleting eventual pkts not acked

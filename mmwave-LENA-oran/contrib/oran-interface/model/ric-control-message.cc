@@ -22,6 +22,8 @@
  *		   Michele Polese <michele.polese@gmail.com>
  */
  
+#include <string.h>
+#include <assert.h>
 #include <ns3/ric-control-message.h>
 #include "E2SM-RC-ControlMessage-Format1-Item.h"
 #include "RANParameter-ValueType-Choice-ElementFalse.h"

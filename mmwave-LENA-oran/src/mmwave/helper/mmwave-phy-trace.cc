@@ -38,6 +38,7 @@
 #include <ns3/simulator.h>
 
 #include <stdio.h>
+#include <fstream>
 
 namespace ns3
 {
@@ -419,6 +420,19 @@ MmWavePhyTrace::RxPacketTraceUeCallback (Ptr<MmWavePhyTrace> phyStats, std::stri
                       << +params.m_rv << "\t" << 10 * std::log10 (params.m_sinr) << "\t" 
                       << params.m_corrupt << "\t" <<  params.m_tbler << std::endl;
 
+  // DEBUG: Log PHY trace events for handover debugging
+  double timestamp = Simulator::Now().GetSeconds();
+  std::string phyTraceDebugFileName = "/dev/null";
+  std::ofstream phyTraceDebugLog(phyTraceDebugFileName.c_str(), std::ios::app);
+  if (phyTraceDebugLog.is_open())
+    {
+      phyTraceDebugLog << timestamp << ",PHY_TRACE_EVENT,Cell" << params.m_cellId
+                       << ",RNTI" << params.m_rnti << ",TB_SIZE=" << params.m_tbSize
+                       << ",MCS=" << (uint32_t)params.m_mcs << ",RV=" << (uint32_t)params.m_rv
+                       << ",SINR_dB=" << (10 * std::log10(params.m_sinr))
+                       << ",CORRUPT=" << (params.m_corrupt ? "YES" : "NO") << std::endl;
+      phyTraceDebugLog.close();
+    }
 
   
   phyStats->UpdateTraces(params);

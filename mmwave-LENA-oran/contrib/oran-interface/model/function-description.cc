@@ -22,6 +22,8 @@
  *		   Michele Polese <michele.polese@gmail.com>
  */
 
+#include <string.h>
+#include <assert.h>
 #include <ns3/function-description.h>
 #include <ns3/asn1c-types.h>
 #include <ns3/log.h>

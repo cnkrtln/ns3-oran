@@ -56,7 +56,7 @@ std::map<uint16_t, Ptr < Node>>
     cellid_node;
 std::map<uint32_t, uint16_t> ue_cellid_usinghandover;
 std::map<uint64_t, uint32_t> ueimsi_nodeid;
-int ue_assoc_list[10] = {0};
+std::map<uint64_t, int> ue_assoc_list;
 double maxXAxis;
 double maxYAxis;
 bool esON_list[10] = {0};
@@ -155,7 +155,7 @@ PrintGnuplottableEnbListToFile(uint64_t m_startTime) {
                 for (const auto &ue: ueMap) {
                     uint64_t imsi_assoc = ue.second->GetImsi();
                     //NS_LOG_UNCOND ("IMSI: " << imsi_assoc << " associated with cell: "  << mmdev->GetCellId ());
-                    ue_assoc_list[imsi_assoc - 1] = mmdev->GetCellId();
+                    ue_assoc_list[imsi_assoc] = mmdev->GetCellId();
                 }
               uint16_t cell_id = mmdev->GetCellId();
               double es_power = enbPhy->GetTxPower();
@@ -230,7 +230,7 @@ PrintPosition(Ptr<Node> node, int iterator, std::string Filename, uint64_t m_sta
       Ptr <MmWaveUeNetDevice> mmuedev = node->GetDevice(j)->GetObject<MmWaveUeNetDevice>();
       if (mcuedev) {
           imsi = int(mcuedev->GetImsi());
-          int serving_cell = ue_assoc_list[imsi - 1];
+          int serving_cell = ue_assoc_list[imsi];
           if (serving_cell==0){
               serving_cell=1;
             }
@@ -368,9 +368,9 @@ static ns3::GlobalValue mmWave_nodes ("N_MmWaveEnbNodes", "Number of mmWaveNodes
                                       ns3::UintegerValue (4),
                                       ns3::MakeUintegerChecker<uint8_t> ());
 // TODO: next step(make it in correct way, regarding to position)
-// static ns3::GlobalValue lteEnb_nodes ("N_LteEnbNodes", "Number of LteEnbNodes",
-//                                       ns3::UintegerValue (1),
-//                                       ns3::MakeUintegerChecker<uint8_t> ());
+static ns3::GlobalValue lteEnb_nodes ("N_LteEnbNodes", "Number of LteEnbNodes",
+                                      ns3::UintegerValue (1),
+                                      ns3::MakeUintegerChecker<uint8_t> ());
 
 static ns3::GlobalValue ue_s ("N_Ues", "Number of User Equipments",
                               ns3::UintegerValue (3),
@@ -384,13 +384,13 @@ static ns3::GlobalValue bandwidth_value ("Bandwidth", "Bandwidth Value",
                                          ns3::DoubleValue (20e6),
                                          ns3::MakeDoubleChecker<double> ());
 // TODO: check for later
-// static ns3::GlobalValue num_antennas_McUe ("N_AntennasMcUe", "Number of Antenna as McUe",
-//                                       ns3::IntegerValue (1),
-//                                       ns3::MakeIntegerChecker<int> ());
+static ns3::GlobalValue num_antennas_McUe ("N_AntennasMcUe", "Number of Antenna as McUe",
+                                      ns3::UintegerValue (1),
+                                      ns3::MakeUintegerChecker<uint32_t> ());
 
-// static ns3::GlobalValue num_antennas_MmWave ("N_AntennasMmWave", "Number of Antenna as MmWave",
-//                                       ns3::IntegerValue (1),
-//                                       ns3::MakeIntegerChecker<int> ());
+static ns3::GlobalValue num_antennas_MmWave ("N_AntennasMmWave", "Number of Antenna as MmWave",
+                                      ns3::UintegerValue (1),
+                                      ns3::MakeUintegerChecker<uint32_t> ());
 
 static ns3::GlobalValue interside_distance_value_ue ("IntersideDistanceUEs", "Interside Distance Value",
                                       ns3::DoubleValue (500),
@@ -420,9 +420,9 @@ main(int argc, char *argv[]) {
   // The maximum X coordinate of the scenario
 
 
-  maxXAxis = 4000;
+  maxXAxis = 2000;
   // The maximum Y coordinate of the scenario
-  maxYAxis = 4000;
+  maxYAxis = 2000;
 
   // Command line arguments
   CommandLine cmd;
@@ -564,19 +564,23 @@ Config::SetDefault ("ns3::ThreeGppChannelConditionModel::UpdatePeriod",
   Config::SetDefault("ns3::ThreeGppPropagationLossModel::Frequency",DoubleValue(3.5e9));
   Config::SetDefault("ns3::ThreeGppPropagationLossModel::ShadowingEnabled",BooleanValue(false));
   // Carrier bandwidth in Hz
-  double bandwidth = 20e6;
+  GlobalValue::GetValueByName ("Bandwidth", doubleValue);
+  double bandwidth = doubleValue.Get ();
   // Center frequency in Hz
-  double centerFrequency = 3.5e9;
+  GlobalValue::GetValueByName ("CenterFrequency", doubleValue);
+  double centerFrequency = doubleValue.Get ();
   // Distance between the mmWave BSs and the two co-located LTE and mmWave BSs in meters
-  double isd_ue = 1000; // (interside distance)
-  double isd_cell = 500; // (interside distance)
+  GlobalValue::GetValueByName ("IntersideDistanceUEs", doubleValue);
+  double isd_ue = doubleValue.Get (); // (interside distance)
+  GlobalValue::GetValueByName ("IntersideDistanceCells", doubleValue);
+  double isd_cell = doubleValue.Get (); // (interside distance)
 
   // Number of antennas in each UE
-  // GlobalValue::GetValueByName ("N_AntennasMcUe", uintegerValue);
-  int numAntennasMcUe = 1; //uintegerValue.Get();
+  GlobalValue::GetValueByName ("N_AntennasMcUe", uintegerValue);
+  int numAntennasMcUe = uintegerValue.Get();
   // Number of antennas in each mmWave BS
-  // GlobalValue::GetValueByName ("N_AntennasMmWave", uintegerValue);
-  int numAntennasMmWave = 1; //uintegerValue.Get();
+  GlobalValue::GetValueByName ("N_AntennasMmWave", uintegerValue);
+  int numAntennasMmWave = uintegerValue.Get();
 
   NS_LOG_INFO("Bandwidth " << bandwidth << " centerFrequency " << double(centerFrequency)
                             << " isd_ue " << isd_ue << " numAntennasMcUe " << numAntennasMcUe
@@ -595,10 +599,12 @@ Config::SetDefault ("ns3::ThreeGppChannelConditionModel::UpdatePeriod",
   Ptr <MmWavePointToPointEpcHelper> epcHelper = CreateObject<MmWavePointToPointEpcHelper>();
   mmwaveHelper->SetEpcHelper(epcHelper);
 
-  uint8_t nMmWaveEnbNodes = 4;
-  // GlobalValue::GetValueByName ("N_LteEnbNodes", uintegerValue);
-  uint8_t nLteEnbNodes = 1; //uintegerValue.Get();
-  uint32_t ues = 15;
+  GlobalValue::GetValueByName ("N_MmWaveEnbNodes", uintegerValue);
+  uint8_t nMmWaveEnbNodes = uintegerValue.Get ();
+  GlobalValue::GetValueByName ("N_LteEnbNodes", uintegerValue);
+  uint8_t nLteEnbNodes = uintegerValue.Get();
+  GlobalValue::GetValueByName ("N_Ues", uintegerValue);
+  uint32_t ues = uintegerValue.Get ();
   // TODO: discuss number of UEs implementation
   //uint8_t nUeNodes = ues * nMmWaveEnbNodes;
   uint8_t nUeNodes = ues;
@@ -690,6 +696,7 @@ Config::SetDefault ("ns3::ThreeGppChannelConditionModel::UpdatePeriod",
   NetDeviceContainer mmWaveEnbDevs = mmwaveHelper->InstallEnbDevice(mmWaveEnbNodes);
   NetDeviceContainer mcUeDevs = mmwaveHelper->InstallMcUeDevice(ueNodes);
 
+  // Install the IP stack on the UEs
   // Install the IP stack on the UEs
   internet.Install(ueNodes);
   Ipv4InterfaceContainer ueIpIface;

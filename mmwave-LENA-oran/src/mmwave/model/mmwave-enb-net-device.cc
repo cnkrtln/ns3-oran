@@ -73,6 +73,7 @@
 #include "encode_e2apv1.hpp"
 #include "ns3/network-module.h"
 #include <any>
+#include <fstream>
 
 namespace ns3 {
 
@@ -117,7 +118,10 @@ MmWaveEnbNetDevice::CalculatePrbAverage()
 
   for (auto ue : ueMap)
   {
-    uint16_t rnti = ue.second->GetRnti();
+    // CRITICAL FIX: Use ue.first (map key) as RNTI, not ue.second->GetRnti()
+    // After handover, ue.second->GetRnti() might return stale/wrong RNTI
+    // The map key (ue.first) IS the RNTI and is always correct
+    uint16_t rnti = ue.first; // RNTI from the map key (CORRECT)
     double macNumberOfSymbols = m_e2DuCalculator->GetMacNumberOfSymbolsUeSpecific(rnti, m_cellId);
     
     auto phyMac = GetMac()->GetConfigurationParameters();
@@ -464,27 +468,43 @@ MmWaveEnbNetDevice::RegisterNewSinrReadingCallback (Ptr<MmWaveEnbNetDevice> netD
 void
 MmWaveEnbNetDevice::RegisterNewSinrReading (uint64_t imsi, uint16_t cellId, long double sinr)
 {
-  // check if the imsi is connected to this DU
-  auto ueMap = m_rrc->GetUeMap ();
-  bool imsiFound = false;
+  // Safety check: m_rrc must be valid
+  if (!m_rrc)
+  {
+    NS_LOG_WARN("RegisterNewSinrReading: m_rrc is null for cell " << m_cellId);
+    return;
+  }
 
-  for (auto ue : ueMap)
-    {
-      if (ue.second->GetImsi () == imsi)
-        {
-          imsiFound = true;
-          break;
-        }
-    }
+  // For serving cell (cellId == m_cellId): verify IMSI is connected to this DU
+  if (cellId == m_cellId)
+  {
+    auto ueMap = m_rrc->GetUeMap ();
+    bool imsiFound = false;
 
-  if (imsiFound)
+    for (auto ue : ueMap)
+      {
+        if (ue.second && ue.second->GetImsi () == imsi)
+          {
+            imsiFound = true;
+            break;
+          }
+      }
+
+    if (!imsiFound)
     {
-      // we only need to save the last value, so we erase if exists already a value nd save the new one
-      m_l3sinrMap[imsi][cellId] = sinr;
-      NS_LOG_LOGIC (Simulator::Now ().GetSeconds ()
-                    << " enbdev " << m_cellId << " UE " << imsi << " report for " << cellId
-                    << " SINR " << m_l3sinrMap[imsi][cellId]);
+      // Don't store serving SINR for UEs not connected to this cell
+      NS_LOG_DEBUG("RegisterNewSinrReading: UE " << imsi << " not connected to cell " << m_cellId << ", skipping serving SINR");
+      return;
     }
+  }
+  // For neighbor cells (cellId != m_cellId): ALWAYS store
+  // This is critical for handover - we need neighbor SINR even if UE is not yet connected to this cell
+
+  // Store the SINR value
+  m_l3sinrMap[imsi][cellId] = sinr;
+  NS_LOG_LOGIC (Simulator::Now ().GetSeconds ()
+                << " enbdev " << m_cellId << " UE " << imsi << " report for " << cellId
+                << " SINR " << m_l3sinrMap[imsi][cellId] << " (stored)");
 }
 
 Ptr<MmWaveEnbPhy>
@@ -564,6 +584,7 @@ MmWaveEnbNetDevice::GetRrc (void)
   return m_rrc;
 }
 
+
 bool
 MmWaveEnbNetDevice::DoSend (Ptr<Packet> packet, const Address &dest, uint16_t protocolNumber)
 {
@@ -606,12 +627,13 @@ MmWaveEnbNetDevice::UpdateConfig (void)
 
           // trigger E2Termination activation for when the simulation starts
           // schedule at start time
-          if (m_e2term)
+          // Create E2 file logs if file logging is enabled OR if E2 termination exists
+          if (m_e2term || m_forceE2FileLogging)
             {
               NS_LOG_DEBUG ("E2sim start in cell " << m_cellId << " force CSV logging "
                                                    << m_forceE2FileLogging);
               //
-              if(!m_forceE2FileLogging) {
+              if (m_e2term && !m_forceE2FileLogging) {
                   Simulator::Schedule (MicroSeconds (0), &E2Termination::Start, m_e2term);
                 }
               //
@@ -734,7 +756,7 @@ MmWaveEnbNetDevice::GetE2Termination () const
 void
 SetBSTX (Ptr<MmWaveEnbPhy> phy, int val, uint16_t cellid, bool m_esON)
 {
-  printf ("in function");
+  printf ("in function SetBSTX"); 
   if (val == 0)
     {
       NS_LOG_UNCOND ("Cell turned off " << cellid << " ,current ES state:" << m_esON);
@@ -754,20 +776,12 @@ SetBSTX (Ptr<MmWaveEnbPhy> phy, int val, uint16_t cellid, bool m_esON)
     }
 }
 void
-MmWaveEnbNetDevice::ControlMessageReceivedCallback (E2AP_PDU_t *sub_req_pdu)
+MmWaveEnbNetDevice::ExecRicControl(long styleType, long actionId, int targetCellId, uint64_t imsi)
 {
   NodeContainer &mmWaveEnbNodes = NodeContainerManager::GetInstance ().GetMmWaveEnbNodes ();
-  NS_LOG_DEBUG (
-      "\nMmWaveEnbNetDevice::ControlMessageReceivedCallback: Received RIC Control Message");
-  // Create RIC Control ACK
-  Ptr<RicControlMessage> controlMessage = Create<RicControlMessage> (sub_req_pdu);
-  //BIT_STRING_t *bit_string = &controlMessage->m_e2SmRcControlHeaderFormat1->ueID.choice.gNB_UEID->ran_UEID
+  NS_LOG_DEBUG ("MmWaveEnbNetDevice::ExecRicControl: Style " << styleType << " Action " << actionId << " Target " << targetCellId << " IMSI " << imsi);
 
-  NS_LOG_INFO ("After RicControlMessage::RicControlMessage constructor");
-  NS_LOG_INFO ("Request ID " << controlMessage->m_ricRequestId.ricRequestorID);
-  NS_LOG_INFO ("Request type " << controlMessage->m_e2SmRcControlHeaderFormat1->ric_Style_Type);
-
-  switch (controlMessage->m_e2SmRcControlHeaderFormat1->ric_Style_Type)
+  switch (styleType)
     {
       case RicControlMessage::ControlMessageServiceStyle::Radio_Bearer_Control: {
         NS_LOG_UNCOND ("Unsupported RIC Style Type ");
@@ -780,50 +794,55 @@ MmWaveEnbNetDevice::ControlMessageReceivedCallback (E2AP_PDU_t *sub_req_pdu)
       }
       case RicControlMessage::ControlMessageServiceStyle::Connected_Mode_Mobility: {
 
-        switch (controlMessage->m_e2SmRcControlHeaderFormat1->ric_ControlAction_ID)
+        switch (actionId)
           {
             case RicControlMessage::Connected_Mode_Mobility_Control_Action_ID::Handover_Control: {
-              NS_LOG_INFO ("Connected mobility, do the handover");
-              // do handover
-              UEID_GNB_t *UEgnb = (UEID_GNB_t *) calloc (1, sizeof (UEID_GNB_t));
+              NS_LOG_INFO("Processing handover for UE " << imsi << " to cell " << targetCellId);
 
-              UEgnb = controlMessage->m_e2SmRcControlHeaderFormat1->ueID.choice.gNB_UEID;
-              uint64_t imsi = {0};
-              memcpy (&imsi, UEgnb->ran_UEID->buf, UEgnb->ran_UEID->size);
-              uint16_t targetCellId = controlMessage->GetTargetCell();
-
-              auto ueMap = m_rrc->GetUeMap();
               bool ueFound = false;
-              for (auto ue : ueMap)
-              {
-                if (ue.second->GetImsi() == imsi)
+              // Iterate over all gNBs to find the one serving this UE
+              for (uint32_t i = 0; i < mmWaveEnbNodes.GetN (); i++)
                 {
-                  ueFound = true;
-                  break;
-                }
-              }
-    
-              if (!ueFound)
-              {
-                NS_LOG_WARN("UE " << imsi << " not found in cell " << m_cellId);
-                return;
-              }
-    
-              NS_LOG_INFO("Processing handover for UE " << imsi << " to cell " << targetCellId);    
+                  Ptr<Node> node = mmWaveEnbNodes.Get (i);
+                  Ptr<MmWaveEnbNetDevice> otherDev = DynamicCast<MmWaveEnbNetDevice> (node->GetDevice (0));
+                  if (!otherDev) continue;
 
-              
-              m_rrc->TakeUeHoControl (imsi);
-              if (!m_forceE2FileLogging)
-                {
-                  Simulator::ScheduleWithContext (1, Seconds (0),
-                                                  &LteEnbRrc::PerformE2RCHO, m_rrc,
-                                                  imsi,targetCellId);
+                  Ptr<LteEnbRrc> otherRrc = otherDev->GetRrc();
+                  if (!otherRrc) continue;
+
+                  auto ueMap = otherRrc->GetUeMap();
+                  if (ueMap.find(imsi) != ueMap.end())
+                    {
+                        // Found the UE source cell
+                        NS_LOG_INFO("UE " << imsi << " found at Cell " << otherDev->GetCellId() << " (Node " << node->GetId() << ")");
+                        
+                        if (otherDev->GetCellId() == targetCellId) {
+                             NS_LOG_WARN("UE " << imsi << " already at Target Cell " << targetCellId << ". Handover ignored.");
+                             ueFound = true;
+                             break;
+                        }
+
+                        otherRrc->TakeUeHoControl (imsi);
+
+                        if (!m_forceE2FileLogging)
+                        {
+                            Simulator::ScheduleWithContext (node->GetId(), Seconds (0),
+                                                            &LteEnbRrc::PerformE2RCHO, otherRrc,
+                                                            imsi, targetCellId);
+                        }
+                        else
+                        {
+                            Simulator::Schedule (Seconds (0), &LteEnbRrc::PerformE2RCHO, otherRrc,
+                                                 imsi, targetCellId);
+                        }
+                        ueFound = true;
+                        break;
+                    }
                 }
-              else
-                {
-                  Simulator::Schedule (Seconds (0), &LteEnbRrc::PerformE2RCHO, m_rrc,
-                                       imsi,targetCellId);
-                }
+
+              if (!ueFound) {
+                   NS_LOG_WARN("UE " << imsi << " NOT found in any known gNB. Handover command ignored.");
+              }
               break;
             }
 
@@ -845,19 +864,7 @@ MmWaveEnbNetDevice::ControlMessageReceivedCallback (E2AP_PDU_t *sub_req_pdu)
         break;
       }
       case RicControlMessage::ControlMessageServiceStyle::Energy_state: {
-        // TODO: Encode the RIC contol request and turn off incoming old cell.
-        // int flexric_cell_id = 2; // from control req
-        // Ptr<MmWaveEnbPhy> enbPhy =
-        //         mmWaveEnbNodes.Get (flexric_cell_id)->GetDevice (0)->GetObject<MmWaveEnbNetDevice> ()->GetPhy ();
-        //     Ptr<MmWaveEnbNetDevice> mmdev =
-        //         DynamicCast<MmWaveEnbNetDevice> (mmWaveEnbNodes.Get (flexric_cell_id)->GetDevice (0));
-        // uint16_t cell_id = mmdev->GetCellId ();
-        // if (cell_id == 2)
-        //   {
-        // printf ("Cell Id %u ", cell_id);
-        // Simulator::ScheduleWithContext (1, MilliSeconds (15), &SetBSTX, enbPhy, 0, flexric_cell_id,
-        //  mmWaveEnbNodes.Get
-        uint16_t targetCellId = controlMessage->GetTargetCell ();
+        
         for (uint32_t i = 0; i < mmWaveEnbNodes.GetN (); i++)
           {
             Ptr<MmWaveEnbPhy> enbPhy =
@@ -867,10 +874,18 @@ MmWaveEnbNetDevice::ControlMessageReceivedCallback (E2AP_PDU_t *sub_req_pdu)
             uint16_t cell_id = mmdev->GetCellId ();
              if (cell_id == targetCellId)
                {
-            printf ("Cell Id %u ", cell_id);
-            Simulator::ScheduleWithContext (1, MilliSeconds (15), &SetBSTX, enbPhy, 0, cell_id,
+            printf ("Cell Id %u, Setting Power to %lu\n", cell_id, (unsigned long)imsi); 
+            // Reuse imsi field for power value in Energy State mode if needed, 
+            // OR assumes fixed logic as before.
+            // Original code used 0 or 30 based on pure presence. 
+            // Let's support passing the power value via 'imsi' param for flexibility 
+            // if style is Energy_state.
+            // If imsi (value) is 0 -> OFF, else -> ON with that power.
+            
+            int txPower = (int)imsi;
+            uint32_t nodeId = mmWaveEnbNodes.Get (i)->GetId ();
+            Simulator::ScheduleWithContext (nodeId, MilliSeconds (15), &SetBSTX, enbPhy, txPower, cell_id,
                                             true);
-            //Simulator::ScheduleWithContext (1,Seconds (tim+5), &SetBSTX, enbPhy, 30, cell_id, false);
             }
           }
         break;
@@ -881,6 +896,54 @@ MmWaveEnbNetDevice::ControlMessageReceivedCallback (E2AP_PDU_t *sub_req_pdu)
       }
     }
 }
+
+void
+MmWaveEnbNetDevice::ControlMessageReceivedCallback (E2AP_PDU_t *sub_req_pdu)
+{
+  NS_LOG_DEBUG (
+      "\nMmWaveEnbNetDevice::ControlMessageReceivedCallback: Received RIC Control Message");
+  // Create RIC Control ACK
+  Ptr<RicControlMessage> controlMessage = Create<RicControlMessage> (sub_req_pdu);
+
+  NS_LOG_INFO ("After RicControlMessage::RicControlMessage constructor");
+  NS_LOG_INFO ("Request ID " << controlMessage->m_ricRequestId.ricRequestorID);
+  NS_LOG_INFO ("Request type " << controlMessage->m_e2SmRcControlHeaderFormat1->ric_Style_Type);
+
+  long styleType = controlMessage->m_e2SmRcControlHeaderFormat1->ric_Style_Type;
+  long actionId = -1;
+  int targetCellId = -1;
+  uint64_t imsi = 0;
+
+  if (styleType == RicControlMessage::ControlMessageServiceStyle::Connected_Mode_Mobility) {
+      actionId = controlMessage->m_e2SmRcControlHeaderFormat1->ric_ControlAction_ID;
+      targetCellId = controlMessage->GetTargetCell();
+      
+      UEID_GNB_t *UEgnb = (UEID_GNB_t *) calloc (1, sizeof (UEID_GNB_t));
+      UEgnb = controlMessage->m_e2SmRcControlHeaderFormat1->ueID.choice.gNB_UEID;
+      if (UEgnb && UEgnb->ran_UEID) {
+          memcpy (&imsi, UEgnb->ran_UEID->buf, UEgnb->ran_UEID->size);
+      }
+  } else if (styleType == RicControlMessage::ControlMessageServiceStyle::Energy_state) {
+      targetCellId = controlMessage->GetTargetCell();
+      // For legacy Energy State, standard behavior was just ON/OFF logic 
+      // encoded implicitly. 
+      // ExecRicControl expects 'imsi' to be used as Power value if Energy State.
+      // But standard message doesn't send "Power Value". 
+      // We will default to 0 (OFF) if action is 0, or 30 (ON) otherwise for now?
+      // Actually original code hardcoded: `SetBSTX, enbPhy, 0, cell_id`
+      // Wait, original code had:
+      // Simulator::ScheduleWithContext (1, MilliSeconds (15), &SetBSTX, enbPhy, 0, cell_id, true);
+      // It sets power to 0. It seems it was "Force OFF".
+      // Let's assume we want to support value passing.
+      // E2 message doesn't have it easily. We will check if we can parse it, 
+      // otherwise default to 0 (OFF) or 30 (ON).
+      // For now, let's keep original behavior:
+      imsi = 0; // Turn OFF
+  }
+
+  ExecRicControl(styleType, actionId, targetCellId, imsi);
+}
+
 
 void
 MmWaveEnbNetDevice::SetE2Termination (Ptr<E2Termination> e2term)
@@ -985,6 +1048,38 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageCuUp (std::string plmId)
   for (auto ue : ueMap)
     {
       uint64_t imsi = ue.second->GetImsi ();
+      uint16_t rnti = ue.first; // RNTI from the map key
+      
+      // Filter: Only report UEs that are actively mapped in this cell
+      // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+      if (imsi == 0)
+        {
+          NS_LOG_DEBUG("BuildRicIndicationMessageCuUp: Skipping UE with RNTI " << rnti << " (invalid IMSI 0) in cell " << m_cellId);
+          continue;
+        }
+      
+      // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+      // If GetImsiFromRnti returns 0 or different IMSI, this RNTI is not active
+      uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+      if (mappedImsi == 0 || mappedImsi != imsi)
+        {
+          // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+          NS_LOG_DEBUG("BuildRicIndicationMessageCuUp: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                       << " (RNTI->IMSI mapping: " << mappedImsi << ") in cell " << m_cellId);
+          continue;
+        }
+      
+      // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+      // Double-check to ensure consistency
+      uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+      if (mappedRnti == 0 || mappedRnti != rnti)
+        {
+          // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+          NS_LOG_DEBUG("BuildRicIndicationMessageCuUp: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                       << " (IMSI->RNTI mapping: " << mappedRnti << ") in cell " << m_cellId);
+          continue;
+        }
+      
       std::string ueImsiComplete = GetImsiString (imsi);
 
       // double rxDlPackets = m_e2PdcpStatsCalculator->GetDlRxPackets(imsi, 3); // LCID 3 is used for data
@@ -1040,6 +1135,7 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageCuUp (std::string plmId)
       double rlcBitrate = (rlcLatency == 0) ? 0 : pduStats / rlcLatency; // unit kbit/s
 
       m_drbThrDlUeid[imsi] = rlcBitrate;
+      
 
       NS_LOG_DEBUG (Simulator::Now ().GetSeconds ()
                     << " " << m_cellId << " cell, connected UE with IMSI " << imsi
@@ -1097,6 +1193,38 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageCuUp (std::string plmId)
       for (auto ue : ueMap)
         {
           uint64_t imsi = ue.second->GetImsi ();
+          uint16_t rnti = ue.first; // RNTI from the map key
+          
+          // Filter: Only report UEs that are actively mapped in this cell
+          // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+          if (imsi == 0)
+            {
+              NS_LOG_DEBUG("BuildRicIndicationMessageDu: Skipping UE with RNTI " << rnti << " (invalid IMSI 0) in cell " << m_cellId);
+              continue;
+            }
+          
+          // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+          // If GetImsiFromRnti returns 0 or different IMSI, this RNTI is not active
+          uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+          if (mappedImsi == 0 || mappedImsi != imsi)
+            {
+              // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+              NS_LOG_DEBUG("BuildRicIndicationMessageDu: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                           << " (RNTI->IMSI mapping: " << mappedImsi << ") in cell " << m_cellId);
+              continue;
+            }
+          
+          // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+          // Double-check to ensure consistency
+          uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+          if (mappedRnti == 0 || mappedRnti != rnti)
+            {
+              // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+              NS_LOG_DEBUG("BuildRicIndicationMessageDu: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                           << " (IMSI->RNTI mapping: " << mappedRnti << ") in cell " << m_cellId);
+              continue;
+            }
+          
           std::string ueImsiComplete = GetImsiString (imsi);
 
           auto uePms = uePmString.find (imsi)->second;
@@ -1144,13 +1272,28 @@ flip_map (const std::map<A, B> &src)
 Ptr<KpmIndicationMessage>
 MmWaveEnbNetDevice::BuildRicIndicationMessageCuCp (std::string plmId)
 {
-  // DEBUG: Always show debug output for CU-CP
-  printf("=== CU-CP DEBUG (ALWAYS) ===\n");
-  printf("  - Cell ID: %d\n", m_cellId);
-  printf("  - UE Map size: %zu\n", m_rrc->GetUeMap().size());
-  printf("  - m_sendCuCp: %s\n", m_sendCuCp ? "true" : "false");
-  printf("  - L3 SINR map size: %zu\n", m_l3sinrMap.size());
-  printf("  - m_forceE2FileLogging: %s\n", m_forceE2FileLogging ? "true" : "false");
+  // ALWAYS create/initialize filter_debug.txt file (for debugging)
+  // Use EXACT same method as cu-cp-cell-*.txt files
+  std::string filterDebugFileName = "filter_debug.txt";
+  std::ofstream debugFile{};
+  debugFile.open(filterDebugFileName.c_str(), std::ios_base::app);
+  if (debugFile.is_open())
+    {
+      // Check file size to see if we need header
+      debugFile.seekp(0, std::ios::end);
+      std::streampos fileSize = debugFile.tellp();
+      if (fileSize == 0)
+        {
+          // File is empty, write header
+          debugFile << "Time(s),Status,Cell,RNTI,IMSI,RNTI->IMSI,IMSI->RNTI,REASON,m_forceE2FileLogging" << std::endl;
+        }
+      
+      // Log function call (always, to verify it's being called)
+      debugFile << Simulator::Now().GetSeconds() << ",FUNCTION_CALL,Cell" << m_cellId 
+                << ",m_forceE2FileLogging=" << (m_forceE2FileLogging ? "true" : "false")
+                << ",UE_Map_Size=" << m_rrc->GetUeMap().size() << std::endl;
+      debugFile.close();
+    }
   
   Ptr<MmWaveIndicationMessageHelper> indicationMessageHelper =
       Create<MmWaveIndicationMessageHelper> (IndicationMessageHelper::IndicationMessageType::CuCp,
@@ -1160,12 +1303,140 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageCuCp (std::string plmId)
 
   std::unordered_map<uint64_t, std::string> uePmString{};
 
+  // TEST 1: Initialize mapping_debug.txt with header on first run
+  static bool mappingDebugHeaderWritten = false;
+  std::string mappingDebugFileName = "mapping_debug.txt";
+  if (!mappingDebugHeaderWritten)
+    {
+      std::ofstream debugLog(mappingDebugFileName.c_str(), std::ios::trunc);
+      if (debugLog.is_open())
+        {
+          debugLog << "Time(s),Event,Cell,IMSI,RNTI,GetImsiFromRnti,GetRntiFromImsi,Result" << std::endl;
+          debugLog.close();
+        }
+      mappingDebugHeaderWritten = true;
+    }
+
+  // UNCONDITIONAL LOGGING: Log function entry and ueMap size
+  double timestamp = Simulator::Now().GetSeconds();
+  std::ofstream debugLog(mappingDebugFileName.c_str(), std::ios::app);
+  if (debugLog.is_open())
+    {
+      debugLog << timestamp << ",FUNCTION_ENTRY,Cell" << m_cellId 
+               << ",ueMapSize=" << ueMap.size() 
+               << ",m_forceE2FileLogging=" << (m_forceE2FileLogging ? "true" : "false") << std::endl;
+      debugLog.close();
+    }
+
   for (auto ue : ueMap)
     {
       // TODO: RANTI usage in case of needing.
       // auto rnti = ue.first;
       // m_rrc->GetRntiFromImsi(imsi);
       uint64_t imsi = ue.second->GetImsi ();
+      uint16_t rnti = ue.first; // RNTI from the map key
+      
+      // TEST 1: Log every UeManager we check in filtering (UNCONDITIONAL)
+      timestamp = Simulator::Now().GetSeconds();
+      uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+      uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+      
+      // UNCONDITIONAL LOGGING: Log every UeManager checked
+      std::ofstream debugLogLoop(mappingDebugFileName.c_str(), std::ios::app);
+      if (debugLogLoop.is_open())
+        {
+          debugLogLoop << timestamp << ",FILTER_CHECK,Cell" << m_cellId 
+                       << ",IMSI" << imsi << ",RNTI" << rnti
+                       << ",GetImsiFromRnti(rnti)=" << mappedImsi
+                       << ",GetRntiFromImsi(imsi)=" << mappedRnti;
+        }
+      
+      // Filter: Only report UEs that are actively mapped in this cell
+      // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+      if (imsi == 0)
+        {
+          NS_LOG_DEBUG("BuildRicIndicationMessageCuCp: Skipping UE with RNTI " << rnti << " (invalid IMSI 0) in cell " << m_cellId);
+          if (debugLogLoop.is_open())
+            {
+              debugLogLoop << ",FAILED=CHECK1_INVALID_IMSI" << std::endl;
+              debugLogLoop.close();
+            }
+          continue;
+        }
+      
+      // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+      // If GetImsiFromRnti returns 0 or different IMSI, this RNTI is not active
+      if (mappedImsi == 0 || mappedImsi != imsi)
+        {
+          // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+          if (debugLogLoop.is_open())
+            {
+              debugLogLoop << ",FAILED=CHECK2_STALE_REVERSE" << std::endl;
+              debugLogLoop.close();
+            }
+          // Also write to filter_debug.txt for consistency
+          if (m_forceE2FileLogging)
+            {
+              std::string filterDebugFileName = "filter_debug.txt";
+              std::ofstream filterDebugLog(filterDebugFileName.c_str(), std::ios::app);
+              if (filterDebugLog.is_open())
+                {
+                  filterDebugLog << timestamp << ",FILTERED,Cell" << m_cellId 
+                                 << ",RNTI" << rnti << ",IMSI" << imsi 
+                                 << ",RNTI->IMSI=" << mappedImsi << ",REASON=STALE_REVERSE" << std::endl;
+                  filterDebugLog.close();
+                }
+            }
+          continue;
+        }
+      
+      // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+      // Double-check to ensure consistency
+      if (mappedRnti == 0 || mappedRnti != rnti)
+        {
+          // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+          if (debugLogLoop.is_open())
+            {
+              debugLogLoop << ",FAILED=CHECK3_STALE_FORWARD" << std::endl;
+              debugLogLoop.close();
+            }
+          // Also write to filter_debug.txt for consistency
+          if (m_forceE2FileLogging)
+            {
+              std::string filterDebugFileName = "filter_debug.txt";
+              std::ofstream filterDebugLog(filterDebugFileName.c_str(), std::ios::app);
+              if (filterDebugLog.is_open())
+                {
+                  filterDebugLog << timestamp << ",FILTERED,Cell" << m_cellId 
+                                 << ",RNTI" << rnti << ",IMSI" << imsi 
+                                 << ",IMSI->RNTI=" << mappedRnti << ",REASON=STALE_FORWARD" << std::endl;
+                  filterDebugLog.close();
+                }
+            }
+          continue;
+        }
+      
+      // If we get here, the UE passed all filter checks
+      // TEST 1: Log successful pass (UNCONDITIONAL)
+      if (debugLogLoop.is_open())
+        {
+          debugLogLoop << ",PASSED=ALL_CHECKS" << std::endl;
+          debugLogLoop.close();
+        }
+      // Also write to filter_debug.txt for consistency
+      if (m_forceE2FileLogging)
+        {
+          std::string filterDebugFileName = "filter_debug.txt";
+          std::ofstream filterDebugLog(filterDebugFileName.c_str(), std::ios::app);
+          if (filterDebugLog.is_open())
+            {
+              filterDebugLog << timestamp << ",INCLUDED,Cell" << m_cellId 
+                             << ",RNTI" << rnti << ",IMSI" << imsi 
+                             << ",RNTI->IMSI=" << mappedImsi << ",IMSI->RNTI=" << mappedRnti << std::endl;
+              filterDebugLog.close();
+            }
+        }
+      
       std::string ueImsiComplete = GetImsiString (imsi);
 
       Ptr<MeasurementItemList> ueVal = Create<MeasurementItemList> (ueImsiComplete);
@@ -1298,15 +1569,17 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageCuCp (std::string plmId)
 
       uint64_t timestamp = m_startTime + (uint64_t) Simulator::Now ().GetMilliSeconds ();
 
-      for (auto ue : ueMap)
+      // CRITICAL: Only iterate through uePmString (which contains filtered UEs), NOT ueMap
+      // uePmString only contains UEs that passed the filtering checks
+      for (auto uePmIt : uePmString)
         {
-          uint64_t imsi = ue.second->GetImsi ();
+          uint64_t imsi = uePmIt.first;
           std::string ueImsiComplete = GetImsiString (imsi);
 
-          auto uePms = uePmString.find (imsi)->second;
+          auto uePms = uePmIt.second;
 
           std::string to_print = std::to_string (timestamp) + "," + ueImsiComplete + "," +
-                                 std::to_string (ueMap.size ()) + "," + uePms + "\n";
+                                 std::to_string (uePmString.size ()) + "," + uePms + "\n";
 
           NS_LOG_DEBUG (to_print);
 
@@ -1355,20 +1628,10 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageDu (std::string plmId, uint16_t nrC
   printf("  - m_sendDu: %s\n", m_sendDu ? "true" : "false");
   printf("  - m_forceE2FileLogging: %s\n", m_forceE2FileLogging ? "true" : "false");
   
-  bool local_m_forceE2FileLogging;
-
-            if (m_forceE2FileLogging)
-            {
-                local_m_forceE2FileLogging = true;
-            }
-            else
-            {
-                local_m_forceE2FileLogging = false;
-            }
-            if (m_e2andlog)
-            {
-                local_m_forceE2FileLogging = true;
-            }
+  // bool local_m_forceE2FileLogging;
+  // if (m_forceE2FileLogging) { local_m_forceE2FileLogging = true; }
+  // else { local_m_forceE2FileLogging = false; }
+  // if (m_e2andlog) { local_m_forceE2FileLogging = true; }
   Ptr<MmWaveIndicationMessageHelper> indicationMessageHelper =
       Create<MmWaveIndicationMessageHelper> (IndicationMessageHelper::IndicationMessageType::Du,
                                              m_forceE2FileLogging, m_reducedPmValues);
@@ -1406,8 +1669,44 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageDu (std::string plmId, uint16_t nrC
   for (auto ue : ueMap)
     {
       uint64_t imsi = ue.second->GetImsi ();
+      // CRITICAL FIX: Use ue.first (map key) as RNTI, not ue.second->GetRnti()
+      // After handover, ue.second->GetRnti() might return stale/wrong RNTI
+      // The map key (ue.first) IS the RNTI and is always correct
+      uint16_t rnti = ue.first; // RNTI from the map key (CORRECT)
+      
+      // FILTER: Only process UEs that are actively mapped in this cell
+      // This prevents processing stale UEs that have already handed over
+      // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+      if (imsi == 0)
+        {
+          NS_LOG_DEBUG("BuildGUIDu: Skipping UE with RNTI " << rnti << " (invalid IMSI 0) in cell " << m_cellId);
+          continue;
+        }
+      
+      // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+      // If GetImsiFromRnti returns 0 or different IMSI, this RNTI is not active
+      uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+      if (mappedImsi == 0 || mappedImsi != imsi)
+        {
+          // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+          NS_LOG_DEBUG("BuildGUIDu: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                       << " (RNTI->IMSI mapping: " << mappedImsi << ") in cell " << m_cellId);
+          continue;
+        }
+      
+      // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+      // Double-check to ensure consistency
+      uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+      if (mappedRnti == 0 || mappedRnti != rnti)
+        {
+          // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+          NS_LOG_DEBUG("BuildGUIDu: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                       << " (IMSI->RNTI mapping: " << mappedRnti << ") in cell " << m_cellId);
+          continue;
+        }
+      
+      // If we get here, the UE passed all filter checks
       std::string ueImsiComplete = GetImsiString (imsi);
-      uint16_t rnti = ue.second->GetRnti ();
 
       uint32_t macPduUe = m_e2DuCalculator->GetMacPduUeSpecific (rnti, m_cellId);
 
@@ -1668,12 +1967,13 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageDu (std::string plmId, uint16_t nrC
           std::to_string (macSinrBin7CellSpecific) + "," +
           std::to_string (rlcBufferOccupCellSpecific) + "," + std::to_string (ueMap.size ());
 
-      for (auto ue : ueMap)
+      // CRITICAL FIX: Iterate over uePmStringDu (filtered UEs) instead of ueMap (all UEs)
+      // This ensures we only write rows for UEs that passed the filter and have valid data
+      for (auto uePm : uePmStringDu)
         {
-          uint64_t imsi = ue.second->GetImsi ();
+          uint64_t imsi = uePm.first;
           std::string ueImsiComplete = GetImsiString (imsi);
-
-          auto uePms = uePmStringDu.find (imsi)->second;
+          std::string uePms = uePm.second;
 
           std::string to_print = std::to_string (timestamp) + "," + ueImsiComplete + "," +
                                  to_print_cell + "," + uePms + "\n";
@@ -1878,8 +2178,44 @@ MmWaveEnbNetDevice::BuildGUIDu (std::string plmId, uint16_t nrCellId)
   for (auto ue : ueMap)
     {
       uint64_t imsi = ue.second->GetImsi ();
+      uint16_t rnti = ue.first; // RNTI from the map key
+      
+      // FILTER: Only process UEs that are actively mapped in this cell
+      // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+      if (imsi == 0)
+        {
+          continue;
+        }
+      
+      // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+      uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+      if (mappedImsi == 0 || mappedImsi != imsi)
+        {
+          // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+          continue;
+        }
+      
+      // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+      uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+      if (mappedRnti == 0 || mappedRnti != rnti)
+        {
+          // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+          continue;
+        }
+      
+      // Check 4: Verify UE is in CONNECTED_NORMALLY state or HANDOVER_PATH_SWITCH
+      // Only include
+      if (ue.second->GetState () != UeManager::CONNECTED_NORMALLY &&
+          ue.second->GetState () != UeManager::HANDOVER_PATH_SWITCH)
+        {
+          // UE is not in CONNECTED_NORMALLY state - skip it (likely in HANDOVER_PATH_SWITCH)
+          NS_LOG_DEBUG("BuildGUIDu: Skipping UE with RNTI " << rnti << " IMSI " << imsi 
+                       << " (State: " << ue.second->GetState() << " != CONNECTED_NORMALLY) in cell " << m_cellId);
+          continue;
+        }
+      
+      // If we get here, the UE passed all filter checks
       std::string ueImsiComplete = GetImsiString (imsi);
-      uint16_t rnti = ue.second->GetRnti ();
 
       uint32_t macPduUe = m_e2DuCalculator->GetMacPduUeSpecific (rnti, m_cellId);
 
@@ -2058,11 +2394,57 @@ MmWaveEnbNetDevice::BuildGUIDu (std::string plmId, uint16_t nrCellId)
                               (long) 100); // percentage of used PRBs
   long ulPrbUsage = 0; // TODO for future implementation
 
+  // Ensure filename is initialized
+  if (m_duFileName.empty ())
+    {
+      m_duFileName = "du-cell-" + std::to_string (m_cellId) + ".txt";
+    }
+
   std::ofstream csv{};
   csv.open (m_duFileName.c_str (), std::ios_base::app);
   if (!csv.is_open ())
     {
-      NS_FATAL_ERROR ("Can't open file " << m_duFileName.c_str ());
+      // Try to create the file with header if it doesn't exist
+      csv.open (m_duFileName.c_str (), std::ios_base::out);
+      if (!csv.is_open ())
+        {
+          NS_FATAL_ERROR ("Can't open file " << m_duFileName.c_str ());
+        }
+      // Write header if file was just created
+      std::string header_csv = "timestamp,ueImsiComplete,plmId,nrCellId,dlAvailablePrbs,"
+                               "ulAvailablePrbs,qci,dlPrbUsage,ulPrbUsage";
+      std::string cell_header =
+          "TB.TotNbrDl.1,TB.TotNbrDlInitial,TB.TotNbrDlInitial.Qpsk,"
+          "TB.TotNbrDlInitial.16Qam,"
+          "TB.TotNbrDlInitial.64Qam,RRU.PrbUsedDl,TB.ErrTotalNbrDl.1,"
+          "QosFlow.PdcpPduVolumeDL_Filter,CARR.PDSCHMCSDist.Bin1,"
+          "CARR.PDSCHMCSDist.Bin2,"
+          "CARR.PDSCHMCSDist.Bin3,CARR.PDSCHMCSDist.Bin4,CARR.PDSCHMCSDist.Bin5,"
+          "CARR.PDSCHMCSDist.Bin6,L1M.RS-SINR.Bin34,L1M.RS-SINR.Bin46, "
+          "L1M.RS-SINR.Bin58,"
+          "L1M.RS-SINR.Bin70,L1M.RS-SINR.Bin82,L1M.RS-SINR.Bin94,L1M.RS-SINR.Bin127,"
+          "DRB.BufferSize.Qos,DRB.MeanActiveUeDl";
+      std::string ue_header =
+          "TB.TotNbrDl.1.UEID,TB.TotNbrDlInitial.UEID,TB.TotNbrDlInitial.Qpsk.UEID,"
+          "TB.TotNbrDlInitial.16Qam.UEID,TB.TotNbrDlInitial.64Qam.UEID,"
+          "TB.ErrTotalNbrDl.1.UEID,"
+          "QosFlow.PdcpPduVolumeDL_Filter.UEID,RRU.PrbUsedDl.UEID,"
+          "CARR.PDSCHMCSDist.Bin1.UEID,"
+          "CARR.PDSCHMCSDist.Bin2.UEID,CARR.PDSCHMCSDist.Bin3.UEID,"
+          "CARR.PDSCHMCSDist.Bin4.UEID,"
+          "CARR.PDSCHMCSDist.Bin5.UEID,"
+          "CARR.PDSCHMCSDist.Bin6.UEID,L1M.RS-SINR.Bin34.UEID, L1M.RS-SINR.Bin46.UEID,"
+          "L1M.RS-SINR.Bin58.UEID,L1M.RS-SINR.Bin70.UEID,L1M.RS-SINR.Bin82.UEID,"
+          "L1M.RS-SINR.Bin94.UEID,L1M.RS-SINR.Bin127.UEID,DRB.BufferSize.Qos.UEID,"
+          "DRB.UEThpDl.UEID, DRB.UEThpDlPdcpBased.UEID";
+      csv << header_csv + "," + cell_header + "," + ue_header + "\n";
+      csv.close ();
+      // Reopen in append mode
+      csv.open (m_duFileName.c_str (), std::ios_base::app);
+      if (!csv.is_open ())
+        {
+          NS_FATAL_ERROR ("Can't open file " << m_duFileName.c_str () << " for appending");
+        }
     }
 
   uint64_t timestamp = m_startTime + (uint64_t) Simulator::Now ().GetMilliSeconds ();
@@ -2094,14 +2476,16 @@ MmWaveEnbNetDevice::BuildGUIDu (std::string plmId, uint16_t nrCellId)
       std::to_string (macSinrBin3CellSpecific) + "," + std::to_string (macSinrBin4CellSpecific) +
       "," + std::to_string (macSinrBin5CellSpecific) + "," +
       std::to_string (macSinrBin6CellSpecific) + "," + std::to_string (macSinrBin7CellSpecific) +
-      "," + std::to_string (rlcBufferOccupCellSpecific) + "," + std::to_string (ueMap.size ());
+      "," + std::to_string (rlcBufferOccupCellSpecific) + "," + std::to_string (uePmStringDu.size ());
 
-  for (auto ue : ueMap)
+  // CRITICAL: Only iterate through uePmStringDu (which contains filtered UEs), NOT ueMap
+  // uePmStringDu only contains UEs that passed the filtering checks
+  for (auto uePmIt : uePmStringDu)
     {
-      uint64_t imsi = ue.second->GetImsi ();
+      uint64_t imsi = uePmIt.first;
       std::string ueImsiComplete = GetImsiString (imsi);
 
-      auto uePms = uePmStringDu.find (imsi)->second;
+      auto uePms = uePmIt.second;
 
       std::string to_print = std::to_string (timestamp) + "," + ueImsiComplete + "," +
                              to_print_cell + "," + uePms + "\n";
@@ -2128,6 +2512,32 @@ MmWaveEnbNetDevice::BuildGUICuCp (std::string plmId)
       // auto rnti = ue.first;
       // m_rrc->GetRntiFromImsi(imsi);
       uint64_t imsi = ue.second->GetImsi ();
+      uint16_t rnti = ue.first; // RNTI from the map key
+      
+      // FILTER: Only process UEs that are actively mapped in this cell
+      // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+      if (imsi == 0)
+        {
+          continue;
+        }
+      
+      // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+      uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+      if (mappedImsi == 0 || mappedImsi != imsi)
+        {
+          // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+          continue;
+        }
+      
+      // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+      uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+      if (mappedRnti == 0 || mappedRnti != rnti)
+        {
+          // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+          continue;
+        }
+      
+      // If we get here, the UE passed all filter checks
       std::string ueImsiComplete = GetImsiString (imsi);
 
       Ptr<MeasurementItemList> ueVal = Create<MeasurementItemList> (ueImsiComplete);
@@ -2226,15 +2636,17 @@ MmWaveEnbNetDevice::BuildGUICuCp (std::string plmId)
 
   uint64_t timestamp = m_startTime + (uint64_t) Simulator::Now ().GetMilliSeconds ();
 
-  for (auto ue : ueMap)
+  // CRITICAL: Only iterate through uePmString (which contains filtered UEs), NOT ueMap
+  // uePmString only contains UEs that passed the filtering checks
+  for (auto uePmIt : uePmString)
     {
-      uint64_t imsi = ue.second->GetImsi ();
+      uint64_t imsi = uePmIt.first;
       std::string ueImsiComplete = GetImsiString (imsi);
 
-      auto uePms = uePmString.find (imsi)->second;
+      auto uePms = uePmIt.second;
 
       std::string to_print = std::to_string (timestamp) + "," + ueImsiComplete + "," +
-                             std::to_string (ueMap.size ()) + "," + uePms + "\n";
+                             std::to_string (uePmString.size ()) + "," + uePms + "\n";
 
       NS_LOG_DEBUG (to_print);
 
@@ -2262,6 +2674,32 @@ MmWaveEnbNetDevice::BuildGUICuUp (std::string plmId)
   for (auto ue : ueMap)
     {
       uint64_t imsi = ue.second->GetImsi ();
+      uint16_t rnti = ue.first; // RNTI from the map key
+      
+      // FILTER: Only process UEs that are actively mapped in this cell
+      // Check 1: Skip UEs with invalid IMSI (0 or uninitialized)
+      if (imsi == 0)
+        {
+          continue;
+        }
+      
+      // Check 2: Verify RNTI is mapped to this IMSI (reverse lookup)
+      uint64_t mappedImsi = m_rrc->GetImsiFromRnti (rnti);
+      if (mappedImsi == 0 || mappedImsi != imsi)
+        {
+          // RNTI is not mapped to this IMSI - stale UeManager (handed over), skip it
+          continue;
+        }
+      
+      // Check 3: Verify IMSI is mapped to this RNTI (forward lookup)
+      uint16_t mappedRnti = m_rrc->GetRntiFromImsi (imsi);
+      if (mappedRnti == 0 || mappedRnti != rnti)
+        {
+          // IMSI is not mapped to this RNTI - stale UeManager (handed over), skip it
+          continue;
+        }
+      
+      // If we get here, the UE passed all filter checks
       std::string ueImsiComplete = GetImsiString (imsi);
 
       // double rxDlPackets = m_e2PdcpStatsCalculator->GetDlRxPackets(imsi, 3); // LCID 3 is used for data
