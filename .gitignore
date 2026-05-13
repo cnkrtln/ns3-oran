@@ -34,3 +34,8 @@ Thumbs.db
 *.tmp
 *.temp
 *~
+
+# Simulation Outputs
+ns3_sim_outputs/
+sim_output/
+xapp_template_outputs/
